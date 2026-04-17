@@ -1,4 +1,4 @@
-# UA_DATA_ENGINEER_ASSESSMENT
+# UA_DATA_ENGINEER_ASSESSMENT - VoNgocThanh
 ## Part 1: Grain Definition
 
 ### TASK 1A: Define the Grain of Each Fact Table 
