@@ -23,9 +23,9 @@
 | Grain Option | Correct / Incorrect? | Why |
 |--------------|---------------------|-----|
 | One row per order | Incorrect | This grain is too aggregated and removes cost category and time dimensions. It prevents detailed cost breakdown and accurate financial analysis across categories and periods. |
-| One row per order × cost category | Incorrect | This grain captures cost breakdown but loses the time dimension. Since financial data is tracked monthly, removing month prevents trend analysis and period-based reporting. |
-| One row per order × cost category × month | Correct | This is the correct grain because it represents the lowest level of financial measurement. It aligns with the source structure (order × cost category × month), supports accurate cost breakdown, time-based analysis, and flexible aggregation across dimensions such as customer and season. |
-| One row per customer × month | Incorrect | This is an aggregated grain and does not represent atomic transactional data. It removes order-level detail and prevents accurate allocation of cost categories. |
+| One row per order x cost category | Incorrect | This grain captures cost breakdown but loses the time dimension. Since financial data is tracked monthly, removing month prevents trend analysis and period-based reporting. |
+| One row per order x cost category x month | Correct | This is the correct grain because it represents the lowest level of financial measurement. It aligns with the source structure (order × cost category × month), supports accurate cost breakdown, time-based analysis, and flexible aggregation across dimensions such as customer and season. |
+| One row per customer x month | Incorrect | This is an aggregated grain and does not represent atomic transactional data. It removes order-level detail and prevents accurate allocation of cost categories. |
 
 **Follow-up: Adding Region Dimension**
 
