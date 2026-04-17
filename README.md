@@ -140,20 +140,135 @@ At that stage, the function can dynamically read `Aggregation_Method` from the m
 
 ### TASK 2A BOTH: Bronze / Silver / Gold Layer Design
 
-| Layer      | Source          | Contents           | Transformations Applied             | File Format                  | Partitioning Strategy  |
-| ---------- | --------------- | ------------------ | ----------------------------------- | ---------------------------- | ---------------------- |
-| **Bronze** | KPI Actuals (long + wide) | Raw copies of `kpi_actual_long.csv` and `kpi_actual_wide.csv`, plus ingestion metadata    | No business transformation. Only schema capture, source tagging, ingestion timestamp, optional file checksum    | Raw CSV landed as-is, then stored as **Bronze Parquet/Delta mirror** for audit + replay           | `source_name`, `ingestion_date`                           |
-| **Bronze** | KPI Master Dim            | Raw `kpi_master_dim.csv` with SCD-related columns preserved exactly as received                                         | No business logic. Add ingestion metadata and row checksum                                                                                                                                                           | Raw CSV + Bronze Parquet/Delta mirror  | `ingestion_date`                                          |
-| **Bronze** | ERP API (orders + lines)  | Raw JSON payloads from headers and details endpoints, each record enriched with ingestion timestamp and source endpoint | Transport-only logic: API/file read, retry, malformed JSON handling, response logging, auth-ready wrapper                                                                                                            | **JSON** for immutable raw payload retention, optionally mirrored to Parquet for query efficiency | `endpoint_name`, `ingestion_date`                         |
-| **Bronze** | Financial Flat File       | Raw `financial_long_format.csv`, `financial_wide_format.csv`, and FX reference file                                     | No business cleanup. Preserve dirty values exactly for traceability                                                                                                                                                  | Raw CSV + Bronze Parquet/Delta mirror                                                             | `source_name`, `ingestion_date`                           |
-| **Silver** | KPI Actuals unified       | Canonical KPI monthly fact-ready dataset at grain **KPI + Sub KPI Type + Month**                                        | OCR fix, trim/case normalization, deduplication, unpivot long and wide formats, period standardization to `YYYY-MM`, reconciliation across both source layouts, join to active KPI master, orphan flagging, row_hash | **Delta/Parquet**                                                                                 | `year`, `month` derived from `period`                     |
-| **Silver** | Orders + Lines            | Clean conformed ERP order-line dataset joining headers and details                                                      | Flatten payload, standardize columns, join `order_id`, derive order/line structures, validate referential integrity, flag malformed or unmatched records                                                             | **Delta/Parquet**                                                                                 | `ingestion_date` or `order_year_month` if available later |
-| **Silver** | Financial costs           | Canonical cost dataset at grain **order × cost category × month**                                                       | OCR fix, category normalization, whitespace/casing cleanup, period normalization, unpivot wide dates, deduplicate, normalize customer names, FX conversion to VND, orphan order flag (`ORD-099`)                     | **Delta/Parquet**                                                                                 | `year`, `month`                                           |
-| **Gold**   | KPI achievement summary   | Business-facing KPI reporting tables: monthly KPI achievement, pillar rollups, YTD KPI actuals                          | Join fact + dimensions, apply aggregation logic from KPI master, compute `achievement_pct`, exclude orphan/invalid rows from official aggregates, expose BI-ready star outputs                                       | **Delta/Parquet**, optionally SQL serving table                                                   | `year`, `month`                                           |
-| **Gold**   | Order cost reporting      | Business-facing order cost marts: total cost by customer/month, cost breakdown, original + converted currency values    | Aggregate clean Silver costs, join conformed customer/date/currency dimensions, calculate totals and category mix                                                                                                    | **Delta/Parquet**, optionally SQL serving table                                                   | `year`, `month`                                           |
+#### Overview
+
+This pipeline uses a **medallion architecture** (Bronze → Silver → Gold) applied
+consistently across both workstreams:
+
+- **Workstream A** — KPI Tracking (CSV + KPI Master)
+- **Workstream B** — ERP Order Cost (REST API + Financial Flat File)
+
+Both workstreams share the same Bronze / Silver / Gold structure and are orchestrated in one pipeline.
+Bronze keeps raw source fidelity, Silver standardizes data into the correct business grain, and Gold publishes reporting-ready outputs. This matches the assessment requirement that both workstreams use the same medallion architecture.
+
+---
+
+#### 1. Medallion Architecture Table
+
+| Layer      | Source                        | Contents                                                                                         | Transformations Applied                                                                                                                                      | File Format                  | Partitioning Strategy |
+| ---------- | ----------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------- | --------------------- |
+| **Bronze** | **KPI Actuals (long + wide)** | Raw `kpi_actual_long.csv` and `kpi_actual_wide.csv` exactly as received, plus ingestion metadata | No business transformation. Only add `ingestion_timestamp` and `source_file`                                                                                 | CSV preserved + Parquet copy | `ingestion_date`      |
+| **Bronze** | **KPI Master Dim**            | Raw `kpi_master_dim.csv` exactly as received                                                     | No cleaning. Only add `ingestion_timestamp`                                                                                                                  | CSV preserved + Parquet copy | `ingestion_date`      |
+| **Bronze** | **ERP API (orders + lines)**  | Raw JSON payloads from orders headers and order lines endpoints                                  | Read endpoint/file, log response count, add `ingestion_timestamp`, keep raw JSON unchanged                                                                   | JSON (raw)                   | `ingestion_date`      |
+| **Bronze** | **Financial Flat File**       | Raw `financial_long_format.csv`, `financial_wide_format.csv`, and FX reference file              | No cleaning. Only add `ingestion_timestamp` and `source_file`                                                                                                | CSV preserved + Parquet copy | `ingestion_date`      |
+| **Silver** | **KPI Actuals unified**       | One clean monthly KPI dataset reconciled from long and wide inputs                               | Unpivot both source formats, standardize `PERIOD` to `YYYY-MM`, fix OCR typos, normalize text, deduplicate, join to active KPI master, flag orphaned records | Delta / Parquet              | `year`, `month`       |
+| **Silver** | **Orders + Lines**            | One conformed ERP dataset joining order headers and order lines                                  | Rename columns based on assessment mapping, join headers and lines by `order_id`, cast fields, validate structure                                            | Delta / Parquet              | `ingestion_date`      |
+| **Silver** | **Financial costs**           | One clean canonical financial dataset at grain `order × cost category × month`                   | Fix OCR errors, normalize category and customer names, standardize date formats, unpivot wide format, convert to VND, deduplicate, flag `ORD-099`            | Delta / Parquet              | `year`, `month`       |
+| **Gold**   | **KPI achievement summary**   | Monthly KPI reporting output                                                                     | Join KPI fact with dimensions, calculate `achievement_pct`, expose KPI monthly achievement and related summary fields for reporting                          | Delta / Parquet              | `year`, `month`       |
+| **Gold**   | **Order cost reporting**      | Reporting-ready cost mart                                                                        | Aggregate clean financial cost data into reporting output such as cost per customer per month in VND                                                         | Delta / Parquet              | `year`, `month`       |
+
+---
+
+#### 2. Why Parquet over CSV, XLSX, TXT, or JSON for intermediate layers?
+
+For intermediate layers (mainly Silver and Gold), I choose Parquet / Delta instead of CSV, XLSX, TXT, or JSON. This is because Silver and Gold are analytical layers, so they must be optimized for performance, schema reliability, and downstream querying.
+
+1. Parquet / Delta advantages
+- Columnar storage → faster reads for analytics
+- Compression → lower storage cost
+- Schema enforcement → safer than raw text files
+- Spark-native → ideal for PySpark and Fabric Lakehouse
+- Partition support → efficient filtering by year/month
+- Delta adds ACID + MERGE + versioning → useful for UPSERT and controlled incremental loads
+2. Why not use other formats for intermediate layers?
+- CSV: simple and readable, but no schema enforcement and slower to query
+- XLSX: good for business users, but not suitable for scalable pipeline processing
+- TXT: unstructured and weak for analytics
+- JSON: useful for preserving raw API payloads in Bronze, but too verbose and inefficient for Silver/Gold analytics
+3. Final decision
+- Bronze: preserve native raw format where needed
+- Silver / Gold: use Delta / Parquet
+
+---
+
+##### Incremental Load Strategy
+
+
+| Source                  | Bronze Strategy   | Silver Strategy                          | Gold Strategy                       | Justification                                      |
+| ----------------------- | ----------------- | ---------------------------------------- | ----------------------------------- | -------------------------------------------------- |
+| **KPI Actuals**         | Append            | UPSERT by `UA_ID + PERIOD`               | Rebuild partition                   | KPI files may be re-submitted or corrected for the same month, so Silver must update   |
+| **KPI Master Dim**      | Snapshot (weekly) | MERGE / UPSERT by `UA_ID`                | N/A                                 | Master data changes less frequently, but may update targets, ownership, or metadata    |
+| **ERP API**             | Append raw JSON   | MERGE by `order_id` (+ line level)       | N/A                                 | API responses may later include updated order information; Bronze keeps history while Silver maintains latest conformed state  |
+| **Financial Flat File** | Append            | UPSERT by `order_no + category + period` | N/A                                 | Manual financial exports can contain corrections, duplicates, or restatements          |
+| **Gold Outputs**        | N/A               | N/A                                      | Rebuild partition (`year`, `month`) | Gold is derived from Silver, so partition rebuild is simpler and keeps results |
 
 
 
+**Why not full reload every run?**  
+A full reload is simpler, but it does not scale and causes unnecessary recomputation. In this pipeline, Bronze should keep every arrival for traceability, while Silver should keep the latest trusted version of each business record.
+
+---
+
+##### Python vs PySpark — Decision Threshold
 
 
+| Criteria            | Use Python                  | Use PySpark                      |
+| ------------------- | --------------------------- | -------------------------------- |
+| Workload type       | API ingestion, control flow | Data transformation, aggregation |
+| Data size           | Small to medium             | Large / scalable                 |
+| Operation           | I/O bound                   | Compute-heavy                    |
+| Use cases           | API call, retry, logging    | Unpivot, join, dedup, group by   |
+| Example in pipeline | ERP ingestion, config       | KPI + Financial Silver, Gold     |
 
+
+**Threshold guidance:**  
+| Condition                        | Decision           |
+| -------------------------------- | ------------------ |
+| < ~5M rows                       | Python / pandas OK |
+| > ~5M rows                       | Switch to PySpark  |
+| Heavy join / shuffle             | Use PySpark        |
+| Window / aggregation large scale | Use PySpark        |
+
+
+---
+
+##### Microsoft Fabric — Layer-by-Layer Choice
+
+| Layer | Technology | Why |
+|---|---|---|
+| Bronze | Lakehouse (OneLake storage) | Raw file storage, no compute needed, cheap, Parquet queryable via SQL endpoint for inspection |
+| Silver | Lakehouse + Spark notebooks | Spark-based transformation, Delta write, partitioning managed by Fabric runtime |
+| Gold | Lakehouse + SQL Endpoint or Direct Lake | Gold tables are small, query patterns are known; SQL Endpoint gives semantic layer access; Direct Lake skips import for large tables in Power BI |
+| Serving (BI) | Direct Lake mode in Power BI | Reads Gold Delta tables directly from OneLake without import, near-real-time refresh |
+
+**When SQL Endpoint becomes wrong:** If Gold tables grow beyond ~10GB or require
+complex cross-table joins that Power BI cannot handle, migrate the serving layer
+to a Fabric Data Warehouse. That decision point is not reached in this pipeline's
+current scope.
+
+---
+
+#### 4. Data Flow Summary
+Sources (CSV, API, XLSX)
+↓
+Bronze (raw, partitioned by ingestion_date)
+↓
+Silver (clean, typed, joined, partitioned by year/month)
+↓
+[DQ Gate — PASSED or WARNING proceeds; FAILED halts]
+↓
+Gold (business metrics, partitioned by year/month)
+↓
+BI / Power BI Dashboar
+
+
+#### 5. Layer Contracts (Non-Negotiable Rules)
+
+| Rule | Applies To |
+|---|---|
+| Never clean data in Bronze | Bronze jobs |
+| Never aggregate in Silver | Silver jobs |
+| Never expose raw or orphaned records in Gold aggregations | Gold jobs |
+| Every Silver record must have ROW_HASH, INGESTION_TS, SOURCE_FILE | Silver schema |
+| Gold only runs if DQ gate passes | Airflow DAG |
+| Orphaned records are flagged with IS_ORPHANED = True, never dropped | Silver and Gold |
