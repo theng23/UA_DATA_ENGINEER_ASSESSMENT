@@ -153,7 +153,7 @@ Bronze keeps raw source fidelity, Silver standardizes data into the correct busi
 
 ---
 
-#### 1. Medallion Architecture Table
+#### Medallion Architecture Table
 
 | Layer      | Source                        | Contents                                                                                         | Transformations Applied                                                                                                                                      | File Format                  | Partitioning Strategy |
 | ---------- | ----------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------- | --------------------- |
@@ -169,7 +169,7 @@ Bronze keeps raw source fidelity, Silver standardizes data into the correct busi
 
 ---
 
-#### 2. Why Parquet over CSV, XLSX, TXT, or JSON for intermediate layers?
+#### Why Parquet over CSV, XLSX, TXT, or JSON for intermediate layers?
 
 For intermediate layers (mainly Silver and Gold), I choose Parquet / Delta instead of CSV, XLSX, TXT, or JSON. This is because Silver and Gold are analytical layers, so they must be optimized for performance, schema reliability, and downstream querying.
 
@@ -248,27 +248,3 @@ current scope.
 
 ---
 
-#### 4. Data Flow Summary
-Sources (CSV, API, XLSX)
-↓
-Bronze (raw, partitioned by ingestion_date)
-↓
-Silver (clean, typed, joined, partitioned by year/month)
-↓
-[DQ Gate — PASSED or WARNING proceeds; FAILED halts]
-↓
-Gold (business metrics, partitioned by year/month)
-↓
-BI / Power BI Dashboar
-
-
-#### 5. Layer Contracts (Non-Negotiable Rules)
-
-| Rule | Applies To |
-|---|---|
-| Never clean data in Bronze | Bronze jobs |
-| Never aggregate in Silver | Silver jobs |
-| Never expose raw or orphaned records in Gold aggregations | Gold jobs |
-| Every Silver record must have ROW_HASH, INGESTION_TS, SOURCE_FILE | Silver schema |
-| Gold only runs if DQ gate passes | Airflow DAG |
-| Orphaned records are flagged with IS_ORPHANED = True, never dropped | Silver and Gold |
