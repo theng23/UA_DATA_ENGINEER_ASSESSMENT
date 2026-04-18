@@ -1322,20 +1322,340 @@ display(df_kpi_wide_ocr_fixed)
 - The idea for this step is read all value number eg Target,M1,M2.. to fix letter O as digit 0 with log để ghi lại những giá trị thay đổi so với bản gốc
   - long: M1..M12 + Target
   - wide: Jan-24..Dec-24 + Target
-3. 123
+  
+3. Normalise whitespace and casing
 
+<details> 
+<summary>PySpark Script</summary>
+  
+```
+from pyspark.sql import functions as F
+
+# =========================================================
+# DEFINE CATEGORICAL COLUMNS
+# =========================================================
+categorical_cols = [
+    "Pillar",
+    "Sub_Pillar",
+    "Department",
+    "KPI_Name",
+    "Sub_KPI_Type",
+    "Unit"
+]
+
+# =========================================================
+# ENSURE ROW_ID + SOURCE_FILE EXIST
+# =========================================================
+if "ROW_ID" not in df_kpi_long_ocr_fixed.columns:
+    df_kpi_long_ocr_fixed = df_kpi_long_ocr_fixed.withColumn(
+        "ROW_ID",
+        F.sha2(
+            F.concat_ws(
+                "||",
+                F.coalesce(F.col("Pillar").cast("string"), F.lit("")),
+                F.coalesce(F.col("Sub_Pillar").cast("string"), F.lit("")),
+                F.coalesce(F.col("Department").cast("string"), F.lit("")),
+                F.coalesce(F.col("KPI_Name").cast("string"), F.lit("")),
+                F.coalesce(F.col("Sub_KPI_Type").cast("string"), F.lit("")),
+                F.coalesce(F.col("Unit").cast("string"), F.lit(""))
+            ),
+            256
+        )
+    )
+
+if "SOURCE_FILE" not in df_kpi_long_ocr_fixed.columns:
+    df_kpi_long_ocr_fixed = df_kpi_long_ocr_fixed.withColumn("SOURCE_FILE", F.lit("kpi_actual_long.csv"))
+
+if "ROW_ID" not in df_kpi_wide_ocr_fixed.columns:
+    df_kpi_wide_ocr_fixed = df_kpi_wide_ocr_fixed.withColumn(
+        "ROW_ID",
+        F.sha2(
+            F.concat_ws(
+                "||",
+                F.coalesce(F.col("Pillar").cast("string"), F.lit("")),
+                F.coalesce(F.col("Sub_Pillar").cast("string"), F.lit("")),
+                F.coalesce(F.col("Department").cast("string"), F.lit("")),
+                F.coalesce(F.col("KPI_Name").cast("string"), F.lit("")),
+                F.coalesce(F.col("Sub_KPI_Type").cast("string"), F.lit("")),
+                F.coalesce(F.col("Unit").cast("string"), F.lit(""))
+            ),
+            256
+        )
+    )
+
+if "SOURCE_FILE" not in df_kpi_wide_ocr_fixed.columns:
+    df_kpi_wide_ocr_fixed = df_kpi_wide_ocr_fixed.withColumn("SOURCE_FILE", F.lit("kpi_actual_wide.csv"))
+
+# =========================================================
+# NORMALIZATION RULE
+# =========================================================
+def normalize_categorical_value(col_name):
+    cleaned = F.trim(F.regexp_replace(F.col(col_name), r"\s+", " "))
+    
+    if col_name in ["Pillar"]:
+        return F.upper(cleaned)
+    else:
+        return cleaned
+
+# =========================================================
+# FUNCTION: NORMALIZE + LOG EVERY CHANGE
+# =========================================================
+def normalize_and_log(df, categorical_columns):
+    log_dfs = []
+    cleaned_df = df
+
+    for col_name in categorical_columns:
+        if col_name not in cleaned_df.columns:
+            continue
+
+        before_col = f"__before_{col_name}"
+        after_col = f"__after_{col_name}"
+
+        cleaned_df = cleaned_df.withColumn(before_col, F.col(col_name))
+        cleaned_df = cleaned_df.withColumn(after_col, normalize_categorical_value(col_name))
+
+        log_df = (
+            cleaned_df
+            .filter(
+                F.coalesce(F.col(before_col).cast("string"), F.lit("")) !=
+                F.coalesce(F.col(after_col).cast("string"), F.lit(""))
+            )
+            .select(
+                "ROW_ID",
+                "SOURCE_FILE",
+                F.lit(col_name).alias("COLUMN_NAME"),
+                F.col(before_col).cast("string").alias("ORIGINAL_VALUE"),
+                F.col(after_col).cast("string").alias("CORRECTED_VALUE"),
+                F.current_timestamp().alias("LOGGED_AT")
+            )
+        )
+
+        log_dfs.append(log_df)
+
+        cleaned_df = cleaned_df.withColumn(col_name, F.col(after_col))
+        cleaned_df = cleaned_df.drop(before_col, after_col)
+
+    if log_dfs:
+        final_log = log_dfs[0]
+        for x in log_dfs[1:]:
+            final_log = final_log.unionByName(x)
+    else:
+        final_log = spark.createDataFrame(
+            [],
+            "ROW_ID string, SOURCE_FILE string, COLUMN_NAME string, ORIGINAL_VALUE string, CORRECTED_VALUE string, LOGGED_AT timestamp"
+        )
+
+    return cleaned_df, final_log
+
+# =========================================================
+# APPLY TO LONG AND WIDE
+# =========================================================
+df_kpi_long_cleaned, df_kpi_long_norm_log = normalize_and_log(df_kpi_long_ocr_fixed, categorical_cols)
+df_kpi_wide_cleaned, df_kpi_wide_norm_log = normalize_and_log(df_kpi_wide_ocr_fixed, categorical_cols)
+
+# combine logs
+df_kpi_norm_log = df_kpi_long_norm_log.unionByName(df_kpi_wide_norm_log)
+
+# =========================================================
+# PREVIEW
+# =========================================================
+print("=== NORMALIZATION LOG ===")
+display(df_kpi_norm_log)
+
+print("=== LONG AFTER NORMALIZATION ===")
+display(df_kpi_long_cleaned)
+
+print("=== WIDE AFTER NORMALIZATION ===")
+display(df_kpi_wide_cleaned)
+```
+</details>
+
+Idea là chuẩn hóa lại tên cũng như là lưu lại log với những cái thay đổi
   1. Lưu giá trị cũ
   2. Apply TRIM + UPPER
   3. So sánh cũ vs mới
   4. Nếu khác → log
   5. Update column
+    
+4. 3
+
+<details> 
+<summary>PySpark Script</summary>
+  
+```
+from pyspark.sql import Window
+from pyspark.sql import functions as F
+import re
+
+# =========================================================
+# BUSINESS KEY COLUMNS
+# =========================================================
+business_key_cols = [
+    "Pillar",
+    "Sub_Pillar",
+    "Department",
+    "KPI_Name",
+    "Sub_KPI_Type",
+    "Unit"
+]
+
+# =========================================================
+# VALUE COLUMNS FOR EACH SOURCE
+# =========================================================
+long_month_cols = [c for c in df_kpi_long_cleaned.columns if re.fullmatch(r"M([1-9]|1[0-2])", c)]
+wide_month_cols = [c for c in df_kpi_wide_cleaned.columns if re.fullmatch(r"[A-Za-z]{3}-\d{2}", c)]
+
+long_value_cols = long_month_cols + ([c for c in ["Target"] if c in df_kpi_long_cleaned.columns])
+wide_value_cols = wide_month_cols + ([c for c in ["Target"] if c in df_kpi_wide_cleaned.columns])
+
+long_dedup_cols = business_key_cols + long_value_cols
+wide_dedup_cols = business_key_cols + wide_value_cols
+
+print("long dedup cols:", long_dedup_cols)
+print("wide dedup cols:", wide_dedup_cols)
+
+
+# =========================================================
+# FUNCTION: DEDUP + LOG
+# =========================================================
+def deduplicate_and_log(df, dedup_cols, source_name):
+    """
+    Keep first row per duplicate group.
+    Drop remaining rows and log them.
+
+    Uses monotonically_increasing_id() as tiebreaker in the Window orderBy
+    because all duplicate rows share the same ROW_ID (SHA256 of business keys).
+    Without a tiebreaker, orderBy(ROW_ID) is non-deterministic — Spark may pick
+    a different "first" row on each run.
+    """
+
+    # Add a stable tiebreaker so row ordering is deterministic across runs
+    df_with_seq = df.withColumn("__row_seq", F.monotonically_increasing_id())
+
+    w = Window.partitionBy(
+        *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in dedup_cols]
+    ).orderBy("__row_seq")
+
+    df_ranked = (
+        df_with_seq
+        .withColumn("DUP_RANK", F.row_number().over(w))
+        .withColumn(
+            "IS_DUPLICATE",
+            F.when(F.col("DUP_RANK") > 1, F.lit(True)).otherwise(F.lit(False))
+        )
+    )
+
+    # Rows to keep — drop internal columns
+    df_deduped = (
+        df_ranked
+        .filter(F.col("IS_DUPLICATE") == False)
+        .drop("DUP_RANK", "__row_seq")
+    )
+
+    # Rows dropped
+    df_dropped = df_ranked.filter(F.col("IS_DUPLICATE") == True)
+
+    # Log dropped rows
+    dedup_reason = (
+        f"Dropped as duplicate within {source_name} "
+        f"after OCR fix and categorical normalization"
+    )
+
+    dedup_key_expr = F.concat_ws(
+        " || ",
+        *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in dedup_cols]
+    )
+
+    df_dedup_log = (
+        df_dropped
+        .select(
+            F.lit("DUPLICATE_DROP").alias("LOG_TYPE"),
+            "ROW_ID",
+            "SOURCE_FILE",
+            F.lit("ROW_LEVEL").alias("COLUMN_NAME"),
+            F.lit(None).cast("string").alias("ORIGINAL_VALUE"),
+            dedup_key_expr.alias("CORRECTED_VALUE"),
+            F.lit(dedup_reason).alias("DETAILS"),
+            F.current_timestamp().alias("LOGGED_AT")
+        )
+    )
+
+    # Summary log
+    dropped_count = df_dropped.count()
+    kept_count = df_deduped.count()
+
+    summary_log = (
+        spark.createDataFrame(
+            [(
+                "DUPLICATE_SUMMARY",
+                source_name,
+                dropped_count,
+                kept_count,
+                f"Detected duplicates using columns: {', '.join(dedup_cols)}"
+            )],
+            ["LOG_TYPE", "SOURCE_FILE", "DROPPED_COUNT", "KEPT_COUNT", "DETAILS"]
+        )
+        .withColumn("LOGGED_AT", F.current_timestamp())
+    )
+
+    return df_deduped, df_dedup_log, summary_log
+
+
+# =========================================================
+# APPLY TO LONG AND WIDE
+# =========================================================
+df_kpi_long_deduped, df_kpi_long_dedup_log, df_kpi_long_dedup_summary = deduplicate_and_log(
+    df_kpi_long_cleaned,
+    long_dedup_cols,
+    "kpi_actual_long.csv"
+)
+
+df_kpi_wide_deduped, df_kpi_wide_dedup_log, df_kpi_wide_dedup_summary = deduplicate_and_log(
+    df_kpi_wide_cleaned,
+    wide_dedup_cols,
+    "kpi_actual_wide.csv"
+)
+
+# Combine row-level logs
+df_kpi_dedup_log = df_kpi_long_dedup_log.unionByName(df_kpi_wide_dedup_log)
+
+# Combine summary logs
+df_kpi_dedup_summary = df_kpi_long_dedup_summary.unionByName(df_kpi_wide_dedup_summary)
+
+# =========================================================
+# PREVIEW
+# =========================================================
+print("=== DEDUP ROW-LEVEL LOG ===")
+display(df_kpi_dedup_log)
+
+print("=== DEDUP SUMMARY LOG ===")
+display(df_kpi_dedup_summary)
+
+print("=== LONG AFTER DEDUP ===")
+display(df_kpi_long_deduped)
+
+print("=== WIDE AFTER DEDUP ===")
+display(df_kpi_wide_deduped)
+```
+</details>
+
+Idea detect và remove duplicate row -> count được 3 trường hợp log phát hiện lỗi và dropped vì bị duplicate row với nhau
 -> sau khi dedup thì kpi_actual_long.csv bị dedup với các cột sau
   - FS || Revenue || Commercial || FOB Revenue || Export || NUMBER ||
   - OF || Productivity || Production || Line Efficiency || Line A || % ||
   - OF || Training || HR || Training Completion || Internal || %
-    
-4. 3
-5. 3
-6. 3
-7. 3
-8. 3
+5. Idea sẽ là unpivot wide format (jan-24...dec-24) into period với format là YYYY-MM
+6. Idea sẽ là unpivot long format M1-M12 into period với format là YYYY-MM
+7. Reconcile both formats into a single unified schema :document how you handle discrepancies
+between them. được hiểu là 
+Case 1 → dedup, giữ 1 row, flag IS_DUPLICATE = True
+Case 2 → giữ cả 2, flag conflict, để business quyết định
+Case 3 → giữ nguyên, không drop
+Case 4 → rename về schema chuẩn trước khi union
+
+Tóm tắt cách xử lý discrepancies
+CaseXử lýCùng KPI + PERIOD + valueDedup, giữ 1, flag IS_DUPLICATE=TrueCùng KPI + PERIOD, khác valueGiữ cả 2, flag IS_CONFLICT=TrueKPI có trong long không có trong wideGiữ nguyên, không dropColumn tên khác nhauRename về schema chuẩn trước khi union
+
+8. Join với bảng dim thông qua Pillar + Sub_Pillar + Department + KPI_Name + Sub_KPI_Type để lấy UA_ID
+9. Ráng cờ cho những record null cụ thể là sẽ dùng IS_ORPHANED và không drop nó
+10. add thêm ROW_HASH (SHA256), INGESTION_TS, SOURCES_FILE, IS_DUPLICATE, IS_ORPHANED
