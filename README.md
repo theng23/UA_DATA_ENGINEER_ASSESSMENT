@@ -456,8 +456,27 @@ Normalization approach:
 - If not in mapping table → flag as UNMATCHED, await business confirmation
 
 ### PART 3: Surrogate Keys and SCD Design
+#### Task 3B: SCD Type 1 vs Type 2 : Decision Table
 
-### PART 4: 
+| Attribute                      | Type       | Justification                                                                                                                                                                                |
+| ------------------------------ | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **kpi_name**                   | **Type 1** | Simple rename that does not change the KPI meaning or calculation logic. Overwriting is sufficient.                                                                                          |
+| **unit (% → Number)**          | **Type 2** | 0.94 (ratio) and 12400 (count) are fundamentally different units. Without versioning, historical data becomes non-comparable and leads to incorrect analysis.                                |
+| **yearly_target (revised M6)** | **Type 2** | Historical targets (M1–M5) must be preserved to calculate **achievement_pct** correctly. Overwriting would recalculate past performance using the new target, causing business inaccuracies. |
+| **aggregation_method**         | **Type 2** | Aggregation method defines how the KPI is computed (SUM / AVERAGE / LAST). Changing it without versioning would silently recalculate historical data incorrectly.                            |
+| **department**                 | **Type 2** | KPI ownership impacts organizational analysis. Historical data must reflect the correct department at each point in time.                                                                    |
+| **is_active**                  | **Type 1** | Represents current status only (active/inactive). It does not affect historical calculations.                                                                                                |
+| **pillar_id**                  | **Type 2** | Pillar is used for grouping KPIs in reporting. If restructured and overwritten, historical data would be incorrectly reassigned to the new pillar.                                           |
+
+
+
+### PART 4: REST API Ingestion
+#### TASK 4A: ERP API Ingestion Script
+
+<details> 
+<summary>Scrip Python API</summary>
+
+
 
 ```
 import json
@@ -973,6 +992,8 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 ```
+</details>
+
 **Script Structure**
 
 | Component                   | Description                                                                                                       |
@@ -987,3 +1008,334 @@ if __name__ == "__main__":
 | **Bronze save**             | Persists raw API responses before any transformation                                                              | 
 | **main()**                  | Orchestrates the full execution flow: fetch → save raw → map fields → join → log result                           |
 
+#### TASK 4B: he ERP Has No API: Scenario Question 
+
+**Scenario**
+The ERP system has **no API, no export functionality, and no database access**.  
+The vendor has confirmed that no API will be built.  
+However, the data is required in the pipeline on a **weekly basis**.
+
+---
+
+#### 1. Options to Get Data
+
+**Option 1 — Manual Export**
+Business users manually extract data from the ERP and upload it weekly.
+
+- **Technical Risk:** Human error, inconsistent format, missing data  
+- **Business Risk:** Depends on individuals (absence → pipeline failure)  
+- **Maintenance Cost:** Low (data team), high (business team)
+
+---
+
+**Option 2 — Web Scraping / Crawling**
+Automate extraction by capturing ERP **HTTP requests (headers, AJAX/XHR)** and replaying them.
+
+- **Technical Risk:**
+  - Dependency on ERP request structure (headers, tokens)
+  - Breaks if UI or request structure changes
+- **Business Risk:**
+  - Pipeline fails if runtime environment is unavailable
+  - Legal/contract risk if scraping violates vendor ToS
+- **Maintenance Cost:** High (requires monitoring and frequent fixes)
+
+**Mitigation:**
+- Run on a **VM/server** instead of a local machine  
+- Schedule jobs using **cron/Airflow**
+
+---
+
+#### 2. Recommended Approach
+
+#### Web Crawling (Running on VM)
+
+**Why:**
+- Only method to extract data directly from ERP without manual dependency  
+- Fully automatable and schedulable  
+- VM removes dependency on local machine  
+
+This approach is based on real-world experience implementing ERP crawling.
+
+---
+
+#### When Recommendation Changes
+
+| Condition | Alternative |
+|----------|------------|
+| Vendor prohibits scraping (legal/ToS) | Manual export |
+| Budget available for automation tools | RPA |
+| Small / low-priority dataset | Manual export |
+| Vendor negotiation possible | Request data feed/API |
+
+---
+
+#### 3. Business Alignment Before Implementation
+
+##### Stakeholders
+- Tech Lead / Data Lead  
+- Business Owner  
+- IT / Security  
+- Legal / Compliance  
+- Senior Management  
+
+##### Key Questions
+- Does the vendor contract allow automated data extraction?  
+- What is the acceptable risk level?  
+- What happens if the pipeline fails?  
+- Is manual fallback acceptable?  
+
+> Do not proceed without **Legal and Security approval**
+
+---
+
+#### 4. Migration Plan (When API Becomes Available)
+
+### Principle
+Separate **ingestion** from **transformation** so the data source can be replaced easily.
+
+**Current: Crawling -> Bronze -> Lakehouse** \
+**Future: API -> Bronze -> Lakehouse**
+
+
+---
+
+##### Migration Steps
+
+**Step 1 — Parallel Run**
+- Run both Crawling and API ingestion  
+- Store outputs separately in Bronze layer  
+
+**Step 2 — Validation**
+- Compare:
+  - Row counts  
+  - Field values  
+  - Aggregations  
+
+**Step 3 — Switch to API**
+- Replace crawling with API ingestion  
+- Monitor for stability (1–2 weeks)
+
+**Step 4 — Cleanup**
+- Remove crawling logic  
+- Update documentation  
+
+---
+
+#### Final Conclusion
+
+- Crawling is a **pragmatic workaround**, not a long-term solution  
+- Must be:
+  - Automated (VM + scheduler)  
+  - Monitored  
+  - Legally aligned  
+
+### PART 5: Silver Transformation
+#### TASK 5A: KPI ACTUALS: Bronze to silver
+1. Ingest both kpi_actual_long.csv and kpi_actual_wide.csv
+
+<details> 
+<summary>PySpark Script</summary>
+
+```
+from pyspark.sql import SparkSession, DataFrame, Window
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+from delta.tables import DeltaTable
+import re
+
+# =========================================================
+# CONFIG
+# =========================================================
+BRONZE_PATH = "Files/UA_TEST"
+
+LONG_FILE = f"{BRONZE_PATH}/kpi_actual_long.csv"
+WIDE_FILE = f"{BRONZE_PATH}/kpi_actual_wide.csv"
+KPI_FILE  = f"{BRONZE_PATH}/kpi_master_dim.csv"
+
+spark = (
+    SparkSession.builder
+    .appName("kpi_actuals_bronze_to_silver")
+    .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+    .getOrCreate()
+)
+
+# =========================================================
+# READ DATAFRAMES
+# =========================================================
+df_kpi_long_raw = (
+    spark.read
+         .option("header", True)
+         .option("inferSchema", False)
+         .csv(LONG_FILE)
+)
+
+df_kpi_wide_raw = (
+    spark.read
+         .option("header", True)
+         .option("inferSchema", False)
+         .csv(WIDE_FILE)
+)
+
+df_kpi_dim_raw = (
+    spark.read
+         .option("header", True)
+         .option("inferSchema", False)
+         .csv(KPI_FILE)
+)
+
+# =========================================================
+# DISPLAY
+# =========================================================
+display(df_kpi_long_raw)
+display(df_kpi_wide_raw)
+display(df_kpi_dim_raw)
+```
+
+</details>
+- Idea for this step is ingest data Bronze to Silver to transformation
+
+2. Fix OCR typos
+
+<details> 
+<summary>PySpark Script</summary>
+
+```
+# =========================================================
+# ADD ROW_ID + SOURCE_FILE
+# =========================================================
+df_kpi_long_step1 = (
+    df_kpi_long_raw
+    .withColumn(
+        "ROW_ID",
+        F.sha2(
+            F.concat_ws("||", *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in df_kpi_long_raw.columns]),
+            256
+        )
+    )
+    .withColumn("SOURCE_FILE", F.lit("kpi_actual_long.csv"))
+)
+
+df_kpi_wide_step1 = (
+    df_kpi_wide_raw
+    .withColumn(
+        "ROW_ID",
+        F.sha2(
+            F.concat_ws("||", *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in df_kpi_wide_raw.columns]),
+            256
+        )
+    )
+    .withColumn("SOURCE_FILE", F.lit("kpi_actual_wide.csv"))
+)
+
+# =========================================================
+# IDENTIFY VALUE COLUMNS
+# - long: M1..M12 + Target if exists
+# - wide: Jan-24..Dec-24 + Target if exists
+# =========================================================
+long_value_cols = [c for c in df_kpi_long_step1.columns if re.fullmatch(r"M([1-9]|1[0-2])", c)]
+wide_value_cols = [c for c in df_kpi_wide_step1.columns if re.fullmatch(r"[A-Za-z]{3}-\d{2}", c)]
+
+if "Target" in df_kpi_long_step1.columns:
+    long_value_cols.append("Target")
+
+if "Target" in df_kpi_wide_step1.columns:
+    wide_value_cols.append("Target")
+
+print("long value cols:", long_value_cols)
+print("wide value cols:", wide_value_cols)
+
+# =========================================================
+# OCR FIX FUNCTION
+# =========================================================
+def fix_ocr_o_to_zero(df, value_cols):
+    log_dfs = []
+    out_df = df
+
+    for col_name in value_cols:
+        before_col = f"__before_{col_name}"
+        after_col = f"__after_{col_name}"
+
+        out_df = out_df.withColumn(before_col, F.col(col_name))
+
+        out_df = out_df.withColumn(
+            after_col,
+            F.when(
+                F.col(col_name).rlike(r"^[0-9Oo\.\,\-\s]+$"),
+                F.regexp_replace(F.col(col_name), r"[Oo]", "0")
+            ).otherwise(F.col(col_name))
+        )
+
+        log_df = (
+            out_df
+            .filter(
+                F.coalesce(F.col(before_col).cast("string"), F.lit("")) !=
+                F.coalesce(F.col(after_col).cast("string"), F.lit(""))
+            )
+            .select(
+                "ROW_ID",
+                "SOURCE_FILE",
+                F.lit(col_name).alias("COLUMN_NAME"),
+                F.col(before_col).cast("string").alias("ORIGINAL_VALUE"),
+                F.col(after_col).cast("string").alias("CORRECTED_VALUE"),
+                F.current_timestamp().alias("LOGGED_AT")
+            )
+        )
+
+        log_dfs.append(log_df)
+
+        out_df = out_df.withColumn(col_name, F.col(after_col))
+        out_df = out_df.drop(before_col, after_col)
+
+    if log_dfs:
+        final_log = log_dfs[0]
+        for x in log_dfs[1:]:
+            final_log = final_log.unionByName(x)
+    else:
+        final_log = spark.createDataFrame(
+            [],
+            "ROW_ID string, SOURCE_FILE string, COLUMN_NAME string, ORIGINAL_VALUE string, CORRECTED_VALUE string, LOGGED_AT timestamp"
+        )
+
+    return out_df, final_log
+
+# =========================================================
+# APPLY OCR FIX
+# =========================================================
+df_kpi_long_ocr_fixed, df_kpi_long_ocr_log = fix_ocr_o_to_zero(df_kpi_long_step1, long_value_cols)
+df_kpi_wide_ocr_fixed, df_kpi_wide_ocr_log = fix_ocr_o_to_zero(df_kpi_wide_step1, wide_value_cols)
+
+df_kpi_ocr_log = df_kpi_long_ocr_log.unionByName(df_kpi_wide_ocr_log)
+
+# =========================================================
+# PREVIEW
+# =========================================================
+print("=== OCR LOG ===")
+display(df_kpi_ocr_log)
+
+print("=== LONG AFTER OCR FIX ===")
+display(df_kpi_long_ocr_fixed)
+
+print("=== WIDE AFTER OCR FIX ===")
+display(df_kpi_wide_ocr_fixed)
+```
+</details>
+- The idea for this step is read all value number eg Target,M1,M2.. to fix letter O as digit 0 with log để ghi lại những giá trị thay đổi so với bản gốc
+  - long: M1..M12 + Target
+  - wide: Jan-24..Dec-24 + Target
+3. 123
+
+  1. Lưu giá trị cũ
+  2. Apply TRIM + UPPER
+  3. So sánh cũ vs mới
+  4. Nếu khác → log
+  5. Update column
+-> sau khi dedup thì kpi_actual_long.csv bị dedup với các cột sau
+  - FS || Revenue || Commercial || FOB Revenue || Export || NUMBER ||
+  - OF || Productivity || Production || Line Efficiency || Line A || % ||
+  - OF || Training || HR || Training Completion || Internal || %
+    
+4. 3
+5. 3
+6. 3
+7. 3
+8. 3
