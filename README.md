@@ -2719,8 +2719,8 @@ Formula: `achievement_pct = actual / target`
 | **Lost Time Injuries**   | Lower is better  | `target / actual`           | `NULL` — report absolute value |
 
 
-### Part6: Schema Evolution and Flexibility 
-#### Task 6A: usiness Changes :Model Survival Test
+### PART 6: Schema Evolution and Flexibility 
+#### TASK 6A: usiness Changes :Model Survival Test
 | #     | Business Change                                                              | How the Model Handles It                                                                                                                                                                                                                                                                                                          |
 | ----- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **1** | A new KPI **“Sustainability Score”** is added under new Sub Pillar **“ESG”** | **Fully handled (schema-flexible)**. Pipeline reads KPI definitions dynamically from `kpi_master_dim.csv`. Adding a new row automatically introduces the KPI in the next run. No code changes required.                                                                                                                         |
@@ -2733,8 +2733,8 @@ Formula: `achievement_pct = actual / target`
 | **8** | Two KPIs are **retired (no actuals after M9)**                               | **Partially handled**. No new records appear after M9, historical data preserved. Requires manual update: set `is_active = N` in `DIM_KPI`. Gold excludes inactive KPIs. Late-arriving data should be flagged `is_orphaned = True`.                                                                                            |
 
 
-### Part 7: Data Quality Framework
-#### Task 7A: Required Quaity Checks
+### PART 7: Data Quality Framework
+#### TASK 7A: Required Quaity Checks
 
 | Level | Meaning         | Pipeline Action            |
 | ----- | ----------------| -------------------------- |
@@ -3010,7 +3010,8 @@ can_proceed = check_dq_gate(dq_log)
 ```
 
 
-### TASK 8A- Airflow DAG
+### PART 8: Airflow DAG
+#### TASK 8A: Required DAG
 My note on experience
 
 I want to be transparent that I have not used Apache Airflow in production in my previous role.
@@ -3027,8 +3028,8 @@ So while Airflow itself is new to me, the underlying concepts are not completely
 
 For this assessment, I will design the DAG based on my understanding of orchestration concepts and the task dependencies provided in the specification. Where I am not fully certain about Airflow-specific implementation details, I will state my assumptions clearly rather than pretend production experience I do not have.
 
-
-### TASK 9A - Gold Layer Scripts
+### PART 9: Gold Layer
+#### TASK 9A: Required Gold Outputs
 
 **Business Purpose of Gold Outputs**
 
@@ -3197,7 +3198,90 @@ Consistent naming helps every team member navigate the codebase,
 understand data structures, and avoid confusion between files,
 scripts, and tables.
 
-#### Task 10C: Service Principal and Credentials 
+#### TASK 10B: Storage Format and Compute Justification
+1. Storage format strategy
+
+| Format  | Bronze | Silver | Gold | Reason                                                    |
+| ------- | ------ | ------ | ---- | --------------------------------------------------------- |
+| CSV     | ✅ Keep | ❌      | ❌    | Business-provided, human-readable → keep for audit        |
+| XLSX    | ✅ Keep | ❌      | ❌    | Original business file → preserve raw version             |
+| JSON    | ✅ Keep | ❌      | ❌    | Raw API format → easy ingestion, lightweight              |
+| Parquet | ✅ Copy | ✅      | ✅    | Columnar, compressed, fast, schema-enforced, Spark-native |
+
+
+Layer Decisions
+- Bronze
+  - Preserve raw formats (CSV/XLSX/JSON) for auditability
+  - Add Parquet copy for efficient downstream processing
+- Silver
+  - Use Parquet (Delta) only
+  - Benefits: schema enforcement, fast queries, supports MERGE, time travel
+- Gold
+  - Use Parquet (Delta) only
+  - Partition by year/month for query pruning
+  - Optimized for BI consumption
+
+Why NOT CSV / JSON in Silver & Gold
+- CSV → no schema → risk of silent data corruption
+- JSON → verbose, slow to query at scale
+
+2. Python vs PySpark
+
+| Criteria   | Python                        | PySpark                         |
+| ---------- | ----------------------------- | ------------------------------- |
+| Best for   | Small data, API ingestion     | Large-scale transformation      |
+| Execution  | Single machine                | Distributed cluster             |
+| Strengths  | Simple, flexible, fast dev    | Scalable, handles joins/shuffle |
+| Weaknesses | Memory-limited, single-thread | Overhead, harder debugging      |
+
+Usage Strategy
+- Python
+  - API ingestion (I/O-bound)
+  - Small reference datasets (FX rates, master data)
+  - Control flow / orchestration
+- PySpark
+  - Silver transformations (unpivot, join, dedup)
+  - Gold aggregations
+  - Large data processing with shuffle/window
+
+Decision Principle
+``No fixed row threshold — choose based on workload type, not size alone.``
+
+Trade-off
+- Python → lower cost, no cluster required
+- PySpark → higher cost, but scales horizontally
+
+3. Microsoft Fabric — Technology Mapping
+
+| Technology     | Best Use Case                 | Used In This Pipeline |
+| -------------- | ----------------------------- | --------------------- |
+| Lakehouse      | Spark ETL + Delta storage     | Bronze, Silver        |
+| SQL Endpoint   | Read-only SQL on Lakehouse    | Ad-hoc queries        |
+| Direct Lake    | Power BI on Delta (no import) | Gold → BI             |
+| Data Warehouse | Serving layer, complex SQL    | Optional              |
+
+4. Design Decisions
+- Silver
+  - Lakehouse + Spark notebooks
+  - Reason: best fit for ETL + Delta + distributed processing
+- Gold
+  - Lakehouse + Direct Lake (Power BI)
+  - Reason:
+    - No data duplication
+    - Near real-time
+    - Simple query patterns
+
+5. When Each Option Becomes Wrong
+
+| Technology     | When It Becomes Wrong               | Alternative                   |
+| -------------- | ----------------------------------- | ----------------------------- |
+| Lakehouse      | Business needs direct SQL access    | SQL Endpoint / Data Warehouse |
+| Direct Lake    | Large data (>10GB) or complex joins | Data Warehouse                |
+| SQL Endpoint   | Need write / transformation         | Lakehouse + Spark             |
+| Data Warehouse | Need distributed ETL (Spark)        | Lakehouse                     |
+
+
+#### TASK 10C: Service Principal and Credentials 
 - I do not have hands-on experience with Azure Service
 Principals or credential management in Azure Data Factory.
 - I am not going to document something I cannot defend in an interview.
