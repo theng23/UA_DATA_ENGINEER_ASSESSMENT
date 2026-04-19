@@ -1,4 +1,6 @@
 # UA_DATA_ENGINEER_ASSESSMENT - VO NGOC THANH
+
+
 ## Part 1: Grain Definition
 
 ### TASK 1A: Define the Grain of Each Fact Table 
@@ -473,6 +475,52 @@ Normalization approach:
 ### PART 4: REST API Ingestion
 #### TASK 4A: ERP API Ingestion Script
 
+> **Note:** The code in this section was implemented based on my own design 
+> flow and reasoning. It may not produce the exact expected output in all 
+> edge cases. The thinking and decisions behind each step are documented 
+> above — those are entirely my own. I used AI to help write the 
+> implementation.
+
+
+This script pulls order data from the ERP system. Here is what it does and why:
+
+**1. Call both endpoints**
+Fetch order headers (GET /orders/headers) and order line items
+(GET /orders/lines) using fetch_with_pagination(). The pagination
+wrapper handles both plain list responses (today) and cursor-based
+paginated responses (future) without breaking either format.
+
+**2. Handle errors before doing anything else**
+validate_required_sources() checks that mock files exist before
+the pipeline starts — fail fast rather than fail mid-run.
+Error types are separated into distinct exceptions so retry logic
+can decide correctly:
+- 4xx / missing file / malformed JSON → fail immediately, do not retry
+- 5xx / connection timeout → retry with exponential backoff + jitter
+
+**3. Save raw to Bronze**
+Raw responses are saved to Bronze before any field mapping.
+If mapping logic changes later, I can reprocess from Bronze
+without re-calling the API.
+Each record gets ingestion_timestamp added at this stage.
+
+**4. Map fields**
+map_order_headers() and map_order_details() translate raw API
+field names (id, userId, postId...) into business names
+(order_id, customer_id, order_id FK...).
+
+**5. Join headers and details**
+join_orders_and_lines() groups line items by order_id and
+attaches them to each header. Orders with no matching lines
+get line_items = [] — they are not dropped.
+
+**6. Design for authentication**
+All auth logic lives in get_auth_headers() inside APIClient.
+The API has no auth today. When Bearer token is required,
+only the CONFIG block changes — nothing else in the pipeline
+needs to be touched.
+
+
 <details> 
 <summary>Scrip Python API</summary>
 
@@ -481,21 +529,54 @@ Normalization approach:
 ```
 import json
 import logging
-import time
+import os
 import random
+import time
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 
 # =========================================================
 # CONFIG
 # =========================================================
-try:
-    BASE_DIR = Path(__file__).resolve().parent
-except NameError:
-    BASE_DIR = Path.cwd()
+def resolve_base_dir() -> Path:
+    """
+    Resolve project root robustly across:
+    - .py script
+    - Jupyter/Notebook
+    - VS Code interactive
+    - terminal run
 
+    Priority:
+      1) PROJECT_ROOT env var
+      2) folder containing this script
+      3) current working dir if it looks like project root
+      4) walk up parents of cwd to find data/raw
+      5) fallback to cwd
+    """
+    env_root = os.getenv("PROJECT_ROOT")
+    if env_root:
+        p = Path(env_root).expanduser().resolve()
+        if p.exists():
+            return p
+
+    if "__file__" in globals():
+        return Path(__file__).resolve().parent
+
+    cwd = Path.cwd().resolve()
+
+    if (cwd / "data" / "raw").exists():
+        return cwd
+
+    for candidate in [cwd, *cwd.parents]:
+        if (candidate / "data" / "raw").exists():
+            return candidate
+
+    return cwd
+
+
+BASE_DIR = resolve_base_dir()
 RAW_DIR = BASE_DIR / "data" / "raw"
 BRONZE_DIR = BASE_DIR / "data" / "bronze"
 LOG_DIR = BASE_DIR / "logs"
@@ -509,23 +590,29 @@ CONFIG = {
     "auth": {
         "enabled": False,
         "bearer_token": None
-        # production: set enabled=True and bearer_token="<token>"
-        # this is the only block that needs to change when auth is added
+        # Production change point:
+        # set enabled=True and provide bearer_token.
+        # Authentication logic is centralized in get_auth_headers().
     },
     "retry": {
-        # 5xx will retry, 4xx will not — retrying a bad request is pointless
         "max_attempts": 3,
-        "base_delay_seconds": 1,   # exponential backoff: 1s, 2s, 4s
-        "jitter": True             # small random offset to avoid thundering herd
+        "base_delay_seconds": 1,
+        "jitter": True
+    },
+    "http": {
+        # Example placeholders for future real API mode
+        "headers_url": None,
+        "details_url": None
     }
 }
 
 
 # =========================================================
-# LOGGING SETUP
+# LOGGING
 # =========================================================
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -536,12 +623,6 @@ def setup_logging() -> None:
     )
 
 
-# =========================================================
-# STRUCTURED ERROR LOG
-# Plain logging.error is not enough — we need structured fields
-# so that months later someone can query: "how many records were
-# lost to malformed JSON in January?" and find the answer immediately
-# =========================================================
 def log_ingestion_error(
     endpoint: str,
     error_type: str,
@@ -551,20 +632,15 @@ def log_ingestion_error(
     ingestion_ts: Optional[str] = None
 ) -> None:
     """
-    Write a structured error record to ingestion_errors.log.
-
-    Fields captured:
-      endpoint      : which endpoint failed
-      request_page  : which page number (if pagination is active)
-      raw_response  : the raw text that caused the error (truncated to 500 chars)
-      error_type    : category of error (MalformedJSON, ConnectionTimeout, HTTP4xx, ...)
-      error_message : full error detail
-      ingestion_ts  : UTC timestamp when the error occurred
+    Structured error log for recoverable ingestion issues,
+    especially malformed JSON.
     """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
     error_record = {
         "endpoint": endpoint,
         "request_page": request_page,
-        "raw_response": raw_response[:500] if raw_response else None,
+        "raw_response": raw_response[:1000] if raw_response else None,
         "error_type": error_type,
         "error_message": error_message,
         "ingestion_ts": ingestion_ts or datetime.now(timezone.utc).isoformat()
@@ -578,53 +654,62 @@ def log_ingestion_error(
 
 
 # =========================================================
-# CUSTOM EXCEPTIONS
+# EXCEPTIONS
 # =========================================================
 class APIIngestionError(Exception):
     """Base exception for all ingestion errors."""
 
+
 class APIConnectionError(APIIngestionError):
-    """Raised when connection or file access fails."""
+    """Transient connection or request failure."""
+
+
+class APISourceNotFoundError(APIIngestionError):
+    """Local mock source file is missing."""
+
 
 class APIEmptyResponseError(APIIngestionError):
-    """Raised when the API or file returns empty data."""
+    """Response is empty."""
+
 
 class APIResponseFormatError(APIIngestionError):
-    """Raised when the response is malformed or not valid JSON."""
+    """Unexpected response structure."""
+
 
 class APIHTTPError(APIIngestionError):
-    """Raised on HTTP errors. Carries status_code so retry logic can decide."""
+    """HTTP error with attached status code."""
     def __init__(self, message: str, status_code: int):
         super().__init__(message)
         self.status_code = status_code
 
 
 # =========================================================
-# RETRY HELPER
-# Key distinction:
-#   4xx = the request itself is wrong (bad URL, unauthorized, not found)
-#         Retrying the same request will always produce the same result — do NOT retry
-#   5xx = the server had a temporary problem, the request is valid
-#         Retrying after a delay has a real chance of succeeding — DO retry
+# RETRY LOGIC
 # =========================================================
 def should_retry(exception: Exception) -> bool:
     """
-    Return True if the exception is transient and worth retrying.
-    - 5xx or ConnectionError  -> retry
-    - 4xx or MalformedJSON    -> do not retry
+    Retry only transient failures:
+    - HTTP 5xx -> retry
+    - connection timeout / request failure -> retry
+    Do NOT retry:
+    - HTTP 4xx
+    - source file missing
+    - malformed JSON
+    - empty response
     """
     if isinstance(exception, APIHTTPError):
         return exception.status_code >= 500
+
     if isinstance(exception, APIConnectionError):
-        return True    # timeout, network drop — transient
-    return False       # malformed JSON, empty response — not transient
+        return True
+
+    if isinstance(exception, APISourceNotFoundError):
+        return False
+
+    return False
 
 
-def with_retry(func, *args, config: Dict, endpoint_name: str, **kwargs):
-    """
-    Execute func with exponential backoff retry.
-    Only retries errors where should_retry() returns True.
-    """
+def with_retry(func, *args, config: Dict[str, Any], endpoint_name: str, **kwargs):
     retry_cfg = config.get("retry", {})
     max_attempts = retry_cfg.get("max_attempts", 3)
     base_delay = retry_cfg.get("base_delay_seconds", 1)
@@ -640,17 +725,15 @@ def with_retry(func, *args, config: Dict, endpoint_name: str, **kwargs):
             last_exception = e
 
             if not should_retry(e):
-                # Non-retryable (4xx, malformed) — fail immediately
-                logging.warning(f"{endpoint_name}: non-retryable error on attempt {attempt}: {e}")
+                logging.warning(
+                    f"{endpoint_name}: non-retryable error on attempt {attempt}: {e}"
+                )
                 raise
 
             if attempt == max_attempts:
                 logging.error(f"{endpoint_name}: all {max_attempts} attempts failed")
                 raise
 
-            # Exponential backoff: 1s, 2s, 4s ...
-            # Jitter adds a small random offset to avoid thundering herd
-            # (multiple failed runs retrying at exactly the same interval)
             delay = base_delay * (2 ** (attempt - 1))
             if jitter:
                 delay += random.uniform(0, 0.5)
@@ -666,88 +749,118 @@ def with_retry(func, *args, config: Dict, endpoint_name: str, **kwargs):
 
 # =========================================================
 # API CLIENT
-# Abstraction over the transport layer.
-# Today: reads local mock JSON files
-# Future: calls real HTTP endpoints
-# Switching between the two requires changing only config["api_mode"]
-# — no changes to ingestion or mapping logic
 # =========================================================
 class APIClient:
-
     def __init__(self, config: Dict[str, Any]):
         self.config = config
 
     def get_auth_headers(self) -> Dict[str, str]:
         """
-        Single place that controls authentication.
-        To add Bearer token in production: set auth.enabled=True and auth.bearer_token.
-        Nothing else in the codebase needs to change.
+        Single place to control authentication.
+        This is the only place that needs changing
+        when auth changes.
         """
         headers = {"Content-Type": "application/json"}
         auth_cfg = self.config.get("auth", {})
+
         if auth_cfg.get("enabled") and auth_cfg.get("bearer_token"):
             headers["Authorization"] = f"Bearer {auth_cfg['bearer_token']}"
+
         return headers
 
-    def get(self, source: Any, endpoint_name: str) -> Any:
-        """Unified GET — delegates to file or HTTP based on config."""
+    def get(
+        self,
+        source: Union[Path, str],
+        endpoint_name: str,
+        page_num: Optional[int] = None
+    ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
         mode = self.config.get("api_mode", "file")
         logging.info(f"Calling endpoint: {endpoint_name} | mode={mode}")
 
         if mode == "file":
-            return self._get_from_file(source, endpoint_name)
-        elif mode == "http":
+            return self._get_from_file(Path(source), endpoint_name, page_num=page_num)
+
+        if mode == "http":
             return with_retry(
                 self._get_from_http_once,
-                source, endpoint_name,
+                source,
+                endpoint_name,
+                page_num=page_num,
                 config=self.config,
                 endpoint_name=endpoint_name
             )
-        else:
-            raise ValueError(f"Unsupported api_mode: {mode}")
 
-    def _get_from_file(self, file_path: Path, endpoint_name: str) -> List[Dict[str, Any]]:
-        """Read a local JSON file as if it were a live API response."""
+        raise ValueError(f"Unsupported api_mode: {mode}")
+
+    def _get_from_file(
+        self,
+        file_path: Path,
+        endpoint_name: str,
+        page_num: Optional[int] = None
+    ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Read local JSON file as mock API response.
+
+        Supports:
+        - current format: JSON list
+        - future-ready format: {"data": [...], "next_page": "..."}
+        """
         try:
             if not file_path.exists():
-                raise APIConnectionError(
+                raise APISourceNotFoundError(
                     f"{endpoint_name}: source file not found: {file_path.resolve()}"
                 )
 
             with open(file_path, "r", encoding="utf-8") as f:
                 raw_text = f.read()
 
+            if not raw_text.strip():
+                raise APIEmptyResponseError(f"{endpoint_name}: empty response")
+
             try:
                 data = json.loads(raw_text)
             except json.JSONDecodeError as e:
-                # Malformed JSON — log structured record and skip
-                # Pipeline must not crash because of partial data loss
                 log_ingestion_error(
                     endpoint=endpoint_name,
                     error_type="MalformedJSON",
                     error_message=str(e),
-                    raw_response=raw_text
+                    raw_response=raw_text,
+                    request_page=page_num
                 )
-                logging.warning(f"{endpoint_name}: malformed JSON — skipping, returning empty list")
+                logging.warning(f"{endpoint_name}: malformed JSON — skipping and returning empty list")
                 return []
 
-            if not data:
-                raise APIEmptyResponseError(f"{endpoint_name}: empty response")
+            if isinstance(data, list):
+                logging.info(f"{endpoint_name}: retrieved {len(data)} records")
+                return data
 
-            if not isinstance(data, list):
-                raise APIResponseFormatError(f"{endpoint_name}: expected a JSON list")
+            if isinstance(data, dict):
+                # Future pagination-compatible format
+                page_data = data.get("data", [])
+                if page_data is None:
+                    page_data = []
+                if not isinstance(page_data, list):
+                    raise APIResponseFormatError(
+                        f"{endpoint_name}: dict response must contain list under 'data'"
+                    )
+                logging.info(
+                    f"{endpoint_name}: retrieved {len(page_data)} records from dict response"
+                )
+                return data
 
-            logging.info(f"{endpoint_name}: retrieved {len(data)} records")
-            return data
+            raise APIResponseFormatError(
+                f"{endpoint_name}: expected JSON list or dict response"
+            )
 
         except OSError as e:
             raise APIConnectionError(f"{endpoint_name}: failed to read file: {e}") from e
 
-    def _get_from_http_once(self, url: str, endpoint_name: str) -> List[Dict[str, Any]]:
-        """
-        Single HTTP GET attempt. Called by with_retry().
-        Raises APIHTTPError with status_code so retry logic knows whether to retry.
-        """
+    def _get_from_http_once(
+        self,
+        url: str,
+        endpoint_name: str,
+        page_num: Optional[int] = None
+    ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
         import requests
 
         try:
@@ -758,18 +871,20 @@ class APIClient:
             )
 
             if 400 <= response.status_code < 500:
-                # Client error — the request itself is wrong, do not retry
                 raise APIHTTPError(
                     f"{endpoint_name}: HTTP {response.status_code} client error — will NOT retry",
                     status_code=response.status_code
                 )
 
             if 500 <= response.status_code < 600:
-                # Server error — transient, retry is appropriate
                 raise APIHTTPError(
                     f"{endpoint_name}: HTTP {response.status_code} server error — will retry",
                     status_code=response.status_code
                 )
+
+            raw_text = response.text
+            if not raw_text.strip():
+                raise APIEmptyResponseError(f"{endpoint_name}: empty response")
 
             try:
                 data = response.json()
@@ -778,19 +893,32 @@ class APIClient:
                     endpoint=endpoint_name,
                     error_type="MalformedJSON",
                     error_message=str(e),
-                    raw_response=response.text
+                    raw_response=raw_text,
+                    request_page=page_num
                 )
                 logging.warning(f"{endpoint_name}: malformed JSON from HTTP — skipping")
                 return []
 
-            if not data:
-                raise APIEmptyResponseError(f"{endpoint_name}: empty response")
+            if isinstance(data, list):
+                logging.info(f"{endpoint_name}: retrieved {len(data)} records")
+                return data
 
-            if not isinstance(data, list):
-                raise APIResponseFormatError(f"{endpoint_name}: expected a JSON list")
+            if isinstance(data, dict):
+                page_data = data.get("data", [])
+                if page_data is None:
+                    page_data = []
+                if not isinstance(page_data, list):
+                    raise APIResponseFormatError(
+                        f"{endpoint_name}: dict response must contain list under 'data'"
+                    )
+                logging.info(
+                    f"{endpoint_name}: retrieved {len(page_data)} records from dict response"
+                )
+                return data
 
-            logging.info(f"{endpoint_name}: retrieved {len(data)} records")
-            return data
+            raise APIResponseFormatError(
+                f"{endpoint_name}: expected JSON list or dict response"
+            )
 
         except requests.Timeout as e:
             raise APIConnectionError(f"{endpoint_name}: connection timeout") from e
@@ -799,30 +927,58 @@ class APIClient:
 
 
 # =========================================================
-# PAGINATION HANDLER
-# The API currently returns a plain list with no pagination.
-# The assessment says we must not assume this will always be true.
-#
-# Design:
-#   - Fetch once
-#   - If response is a plain list  -> no pagination, collect and stop
-#   - If response is a dict with "next_page" -> collect "data", fetch next cursor
-#   - Stop when next_page is None or missing
-#
-# Both formats are handled without breaking either.
+# VALIDATION / DEBUG
 # =========================================================
-def fetch_with_pagination(client: APIClient, source: Any, endpoint_name: str) -> List[Dict[str, Any]]:
+def log_runtime_paths() -> None:
+    logging.info(f"BASE_DIR: {BASE_DIR}")
+    logging.info(f"RAW_DIR: {RAW_DIR}")
+    logging.info(f"BRONZE_DIR: {BRONZE_DIR}")
+    logging.info(f"LOG_DIR: {LOG_DIR}")
+    logging.info(f"HEADERS_SOURCE: {HEADERS_SOURCE}")
+    logging.info(f"DETAILS_SOURCE: {DETAILS_SOURCE}")
+    logging.info(f"HEADERS_SOURCE exists: {HEADERS_SOURCE.exists()}")
+    logging.info(f"DETAILS_SOURCE exists: {DETAILS_SOURCE.exists()}")
+
+
+def validate_required_sources() -> None:
     """
-    Handles two response formats transparently:
+    Validate local mock files early when running in file mode.
+    """
+    if CONFIG.get("api_mode") != "file":
+        return
 
-    Format A — current (no pagination):
-        [{"id": 1, ...}, {"id": 2, ...}]
+    missing = []
 
-    Format B — future (cursor-based pagination):
-        {
-          "data": [{"id": 1, ...}],
-          "next_page": "cursor_abc123"   # null when no more pages
-        }
+    if not HEADERS_SOURCE.exists():
+        missing.append(str(HEADERS_SOURCE.resolve()))
+
+    if not DETAILS_SOURCE.exists():
+        missing.append(str(DETAILS_SOURCE.resolve()))
+
+    if missing:
+        raise APISourceNotFoundError(
+            f"Required mock API files not found. BASE_DIR={BASE_DIR} | missing={missing}"
+        )
+
+
+# =========================================================
+# PAGINATION
+# =========================================================
+def fetch_with_pagination(
+    client: APIClient,
+    source: Union[Path, str],
+    endpoint_name: str
+) -> List[Dict[str, Any]]:
+    """
+    Supports both:
+    Format A:
+      [ {...}, {...} ]
+
+    Format B:
+      {
+        "data": [ {...}, {...} ],
+        "next_page": "cursor_123"
+      }
     """
     all_records: List[Dict[str, Any]] = []
     page_num = 0
@@ -832,32 +988,45 @@ def fetch_with_pagination(client: APIClient, source: Any, endpoint_name: str) ->
         page_num += 1
         logging.info(f"{endpoint_name}: fetching page {page_num}")
 
-        raw_response = client.get(current_source, endpoint_name)
+        response_data = client.get(current_source, endpoint_name, page_num=page_num)
 
-        if isinstance(raw_response, list):
-            # Format A: plain list — no pagination, collect and stop
-            all_records.extend(raw_response)
-            logging.info(f"{endpoint_name}: plain list format, no pagination. Total={len(all_records)}")
+        if isinstance(response_data, list):
+            all_records.extend(response_data)
+            logging.info(
+                f"{endpoint_name}: plain list format, no pagination. Total={len(all_records)}"
+            )
             break
 
-        elif isinstance(raw_response, dict):
-            # Format B: paginated — collect this page, check for next
-            page_data = raw_response.get("data", [])
-            all_records.extend(page_data)
+        if isinstance(response_data, dict):
+            page_data = response_data.get("data", [])
+            next_page = response_data.get("next_page")
 
-            next_page = raw_response.get("next_page")
+            all_records.extend(page_data)
 
             if not next_page:
                 logging.info(f"{endpoint_name}: pagination complete. Total={len(all_records)}")
                 break
+
+            logging.info(
+                f"{endpoint_name}: page {page_num} done, next_page={next_page}"
+            )
+
+            # Only meaningful for real HTTP mode
+            if CONFIG.get("api_mode") == "http":
+                separator = "&" if "?" in str(source) else "?"
+                current_source = f"{source}{separator}cursor={next_page}"
             else:
-                logging.info(f"{endpoint_name}: page {page_num} done, next_page={next_page}")
-                # In file mode this branch will never be reached
-                # In http mode: append cursor to base URL and fetch next page
-                current_source = f"{source}?cursor={next_page}"
-        else:
-            logging.warning(f"{endpoint_name}: unexpected response format on page {page_num}, stopping")
-            break
+                # File mode cannot actually paginate to another file;
+                # break safely after first page dict response
+                logging.info(
+                    f"{endpoint_name}: file mode detected dict response with next_page; "
+                    f"stopping after current page."
+                )
+                break
+            continue
+
+        logging.warning(f"{endpoint_name}: unexpected response type {type(response_data)}")
+        break
 
     return all_records
 
@@ -866,76 +1035,74 @@ def fetch_with_pagination(client: APIClient, source: Any, endpoint_name: str) ->
 # FIELD MAPPING
 # =========================================================
 def map_order_headers(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Map raw API fields to business field names for order headers."""
-    return [{
-        "order_id": r.get("id"),
-        "customer_id": r.get("userId"),
-        "order_code": r.get("title"),
-        "order_notes": r.get("body")
-    } for r in records]
+    return [
+        {
+            "order_id": r.get("id"),
+            "customer_id": r.get("userId"),
+            "order_code": r.get("title"),
+            "order_notes": r.get("body")
+        }
+        for r in records
+    ]
 
 
 def map_order_details(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Map raw API fields to business field names for order line items."""
-    return [{
-        "line_id": r.get("id"),
-        "order_id": r.get("postId"),
-        "line_description": r.get("name"),
-        "buyer_contact": r.get("email"),
-        "line_notes": r.get("body")
-    } for r in records]
+    return [
+        {
+            "line_id": r.get("id"),
+            "order_id": r.get("postId"),
+            "line_description": r.get("name"),
+            "buyer_contact": r.get("email"),
+            "line_notes": r.get("body")
+        }
+        for r in records
+    ]
 
 
 # =========================================================
 # BRONZE SAVE
-# Raw responses are saved to Bronze before any mapping.
-# This preserves the original source data so we can reprocess
-# if mapping logic changes later, without re-calling the API.
 # =========================================================
-def add_ingestion_timestamp(records: List[Dict[str, Any]], ingestion_ts: str) -> List[Dict[str, Any]]:
-    """Add ingestion_timestamp to every record before saving to Bronze."""
+def add_ingestion_timestamp(
+    records: List[Dict[str, Any]],
+    ingestion_ts: str
+) -> List[Dict[str, Any]]:
     return [{**r, "ingestion_timestamp": ingestion_ts} for r in records]
 
 
 def save_bronze(records: List[Dict[str, Any]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
+
     logging.info(f"Saved Bronze: {output_path.resolve()} | records={len(records)}")
 
 
 # =========================================================
-# JOIN LOGIC
+# JOIN
 # =========================================================
 def join_orders_and_lines(
     order_headers: List[Dict[str, Any]],
     order_lines: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """
-    Join order headers with their line items by order_id.
-    Orders with no matching lines get line_items=[] — they are not dropped.
-    """
-    lines_by_order: Dict[Any, List] = {}
+    lines_by_order: Dict[Any, List[Dict[str, Any]]] = {}
+
     for line in order_lines:
         oid = line.get("order_id")
         lines_by_order.setdefault(oid, []).append(line)
 
-    joined = []
+    joined_orders = []
     for header in order_headers:
         oid = header.get("order_id")
-        joined.append({**header, "line_items": lines_by_order.get(oid, [])})
+        joined_orders.append(
+            {
+                **header,
+                "line_items": lines_by_order.get(oid, [])
+            }
+        )
 
-    logging.info(f"Joined: {len(joined)} orders")
-    return joined
-
-
-# =========================================================
-# DEBUG HELPER
-# =========================================================
-def log_runtime_paths() -> None:
-    logging.info(f"BASE_DIR: {BASE_DIR}")
-    logging.info(f"HEADERS_SOURCE exists: {HEADERS_SOURCE.exists()}")
-    logging.info(f"DETAILS_SOURCE exists: {DETAILS_SOURCE.exists()}")
+    logging.info(f"Joined: {len(joined_orders)} orders")
+    return joined_orders
 
 
 # =========================================================
@@ -950,14 +1117,26 @@ def main() -> None:
 
     try:
         log_runtime_paths()
+        validate_required_sources()
 
-        # Step 1: Fetch from both endpoints
-        # Using pagination wrapper to handle both plain list and cursor-paginated responses
-        raw_headers = fetch_with_pagination(client, HEADERS_SOURCE, "GET /orders/headers")
-        raw_details = fetch_with_pagination(client, DETAILS_SOURCE, "GET /orders/lines")
+        # Resolve sources by mode
+        if CONFIG.get("api_mode") == "file":
+            headers_source = HEADERS_SOURCE
+            details_source = DETAILS_SOURCE
+        else:
+            headers_source = CONFIG["http"].get("headers_url")
+            details_source = CONFIG["http"].get("details_url")
 
-        # Step 2: Save raw responses to Bronze with ingestion timestamp
-        # Raw is saved before any mapping — preserves source data for reprocessing
+            if not headers_source or not details_source:
+                raise APIIngestionError(
+                    "HTTP mode requires CONFIG['http']['headers_url'] and CONFIG['http']['details_url']"
+                )
+
+        # Step 1: Fetch
+        raw_headers = fetch_with_pagination(client, headers_source, "GET /orders/headers")
+        raw_details = fetch_with_pagination(client, details_source, "GET /orders/lines")
+
+        # Step 2: Save Bronze
         save_bronze(
             add_ingestion_timestamp(raw_headers, ingestion_ts),
             BRONZE_DIR / "orders_headers_bronze.json"
@@ -967,12 +1146,12 @@ def main() -> None:
             BRONZE_DIR / "orders_details_bronze.json"
         )
 
-        # Step 3: Apply business field mapping
+        # Step 3: Map
         mapped_headers = map_order_headers(raw_headers)
         mapped_details = map_order_details(raw_details)
         logging.info(f"Mapped: {len(mapped_headers)} headers, {len(mapped_details)} details")
 
-        # Step 4: Join headers with their line items
+        # Step 4: Join
         joined_orders = join_orders_and_lines(mapped_headers, mapped_details)
 
         if joined_orders:
@@ -1130,7 +1309,15 @@ Separate **ingestion** from **transformation** so the data source can be replace
   - Legally aligned  
 
 ### PART 5: Silver Transformation
+
+> **Note:** The code in this section was implemented based on my own design 
+> flow and reasoning. It may not produce the exact expected output in all 
+> edge cases. The thinking and decisions behind each step are documented 
+> above — those are entirely my own. I used AI to help write the implementation.
+
 #### TASK 5A: KPI ACTUALS: Bronze to silver
+
+
 1. Ingest both kpi_actual_long.csv and kpi_actual_wide.csv
 
 <details> 
