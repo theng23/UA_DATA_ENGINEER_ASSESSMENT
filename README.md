@@ -3122,7 +3122,7 @@ concerns clearly — each folder has one responsibility.
 I do not have experience setting up CI/CD pipelines.
 This is a gap I am aware of and would prioritize learning on the job.
 I am not going to document something I cannot defend in an interview.
-3. Naming onventions
+3. Naming conventions
    - ``snake_case`` for everything — no mixing with camelCase
    - ``UPPER_SNAKE_CASE`` for metadata/system columns
    - ``lowercase`` for business columns
@@ -3194,6 +3194,7 @@ monthly_kpi_aggregation_pipeline
 ```
 
 4. Why Consistent Naming Matters
+
 Consistent naming helps every team member navigate the codebase,
 understand data structures, and avoid confusion between files,
 scripts, and tables.
