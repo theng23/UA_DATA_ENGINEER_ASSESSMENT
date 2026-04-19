@@ -1331,7 +1331,7 @@ display(df_kpi_wide_ocr_fixed)
   
 3. Normalise whitespace and casing
 
-**Idea:** Standardize all categorical columns to UPPER case with trimmed
+**Idea:** Standardize all categorical columns to Initcap case with Trimmed
 whitespace to ensure consistent joining and grouping downstream.
 
 <details> 
@@ -1873,6 +1873,91 @@ display(df_silver_kpi)
 
 #### TASK 5B: Financial File : Bronze to Silver
 
+1. Ingest financial_long_format.csv and financial_wide_format.csv 
+- **Idea**: Ingest both financial_long_format.csv and financial_wide_format.csv into separate DataFrames. Also ingest exchange_rates_reference.csv for FX conversion later.
+
+<details> 
+<summary>PySpark Script</summary>
+
+```
+# =========================================================
+# STEP 1: INGEST BOTH FILES
+# =========================================================
+financial_long_df = spark.read.option("header", True).csv(
+    "Files/data/raw/financial_long_format.csv"
+)
+financial_wide_df = spark.read.option("header", True).csv(
+    "Files/data/raw/financial_wide_format.csv"
+)
+exchange_rates_df = spark.read.option("header", True).csv(
+    "Files/data/raw/exchange_rates_reference.csv"
+)
+
+print(f"Long rows: {financial_long_df.count()}")
+print(f"Wide rows: {financial_wide_df.count()}")
+print(f"Exchange rates rows: {exchange_rates_df.count()}")
+
+display(financial_long_df)
+display(financial_wide_df)
+display(exchange_rates_df)
+```
+
+</details> 
+
+2. Fix all known dirty data issues
+
+<details> 
+<summary>PySpark Script</summary>
+  
+```
+# =========================================================
+# STEP 2: OCR FIX — replace letter O with digit 0 in amount
+# Only apply when value looks like a number
+# Log every fix: original value, corrected value, order identifier
+#
+# Additional issue found (not in known list):
+# amount column may have leading/trailing spaces — handled in Step 5
+# =========================================================
+combined_df = combined_df.withColumn(
+    "__amount_before", F.col("amount")
+).withColumn(
+    "amount",
+    F.when(
+        F.col("amount").isNotNull() &
+        F.col("amount").rlike(r"^[0-9Oo\.\,\-\s]+$"),
+        F.regexp_replace(F.col("amount"), r"[Oo]", "0")
+    ).otherwise(F.col("amount"))
+)
+
+df_ocr_log = (
+    combined_df
+    .filter(
+        F.coalesce(F.col("__amount_before").cast("string"), F.lit("")) !=
+        F.coalesce(F.col("amount").cast("string"), F.lit(""))
+    )
+    .select(
+        "order_no",
+        F.lit("amount").alias("COLUMN_NAME"),
+        F.col("__amount_before").cast("string").alias("ORIGINAL_VALUE"),
+        F.col("amount").cast("string").alias("CORRECTED_VALUE"),
+        F.lit("OCR_FIX").alias("LOG_TYPE"),
+        "SOURCE_FILE",
+        F.current_timestamp().alias("LOGGED_AT")
+    )
+)
+
+combined_df = combined_df.drop("__amount_before")
+
+print("=== OCR FIX LOG ===")
+display(df_ocr_log)
+```
+</details> 
+
+
+3. 
+4. 
+
+
 
 #### TASK 5C: Handle Mixed Units
 
@@ -1933,29 +2018,29 @@ The **Direction** for each KPI is stored in the `DIM_KPI.direction` column and r
 *Example*: OT Cost Ratio, target = `0.12`  
 Formula: `achievement_pct = target / actual`
 
-| Actual Value | Calculation            | Result | Interpretation         |
-|--------------|------------------------|--------|------------------------|
-| `0.09`       | `0.12 / 0.09 = 133.3%`  | ✅     | Above 100% = good      |
-| `0.15`       | `0.12 / 0.15 = 80.0%`   | ❌     | Below 100% = bad      |
-| `0`          | `NULL`                 | -      | Flag in DQ log — divide by zero, needs business review |
+| Actual Value | Calculation           | Interpretation         |
+|--------------|----------------------|------------------------|
+| `0.09`       | `0.12 / 0.09 = 133.3%`   | Above 100% = good      |
+| `0.15`       | `0.12 / 0.15 = 80.0%`     | Below 100% = bad      |
+| `0`          | `NULL`                | Flag in DQ log — divide by zero, needs business review |
 
 ##### **(b) % KPI — Higher is Better**  
 *Example*: Line Efficiency, target = `0.85`  
 Formula: `achievement_pct = actual / target`
 
-| Actual Value | Calculation            | Result | Interpretation         |
-|--------------|------------------------|--------|------------------------|
-| `0.90`       | `0.90 / 0.85 = 105.9%`  | ✅     | Above 100% = good      |
-| `0.75`       | `0.75 / 0.85 = 88.2%`   | ❌     | Below 100% = bad      |
+| Actual Value | Calculation            | Interpretation         |
+|--------------|------------------------|------------------------|
+| `0.90`       | `0.90 / 0.85 = 105.9%`       | Above 100% = good      |
+| `0.75`       | `0.75 / 0.85 = 88.2%`      | Below 100% = bad      |
 
 ##### **(c) Number KPI — SUM Aggregation**  
 *Example*: FOB Revenue, target = `1,200,000`  
 Formula: `achievement_pct = actual / target`
 
-| Actual Value | Calculation              | Result | Interpretation         |
-|--------------|--------------------------|--------|------------------------|
-| `1,500,000`  | `1,500,000 / 1,200,000 = 125.0%` | ✅     | Above target           |
-| `900,000`    | `900,000 / 1,200,000 = 75.0%`   | ❌     | Below target           |
+| Actual Value | Calculation              | Interpretation         |
+|--------------|--------------------------|------------------------|
+| `1,500,000`  | `1,500,000 / 1,200,000 = 125.0%`   | Above target           |
+| `900,000`    | `900,000 / 1,200,000 = 75.0%`       | Below target           |
 
 ##### **(d) Number KPI — Target is Zero**  
 *Example*: Lost Time Injuries, target = `0`  
@@ -1981,3 +2066,489 @@ Formula: `achievement_pct = actual / target`
 | **Line Efficiency**      | Higher is better | `actual / target`           | N/A          |
 | **FOB Revenue**          | Higher is better | `actual / target`           | N/A          |
 | **Lost Time Injuries**   | Lower is better  | `target / actual`           | `NULL` — report absolute value |
+
+
+### 6A
+| #     | Business Change                                                              | How the Model Handles It                                                                                                                                                                                                                                                                                                          |
+| ----- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1** | A new KPI **“Sustainability Score”** is added under new Sub Pillar **“ESG”** | **Fully handled (schema-flexible)**. Pipeline reads KPI definitions dynamically from `kpi_master_dim.csv`. Adding a new row automatically introduces the KPI in the next run. No code changes required.                                                                                                                         |
+| **2** | **On Time Delivery Rate** changes unit from `%` → `Number` mid-year          | **Partially handled (SCD Type 2)**. `DIM_KPI` creates a new version row with the new unit. Fact joins correctly by time. However, values before and after change are not comparable. Gold layer must flag `unit_changed = True` and block cross-period aggregation. Business decision required (restate history or split KPI). |
+| **3** | **Line Efficiency for Line D** starts from M7 (M1–M6 blank by design)        | **Handled correctly (missing-aware design)**. Rows for M1–M6 exist with `actual_value = NULL` and `is_missing_actual = True`. This is treated as *expected missing*, not data error. Gold excludes NULL from aggregation.                                                                                                       |
+| **4** | Sub Pillar renamed from **“Cost Efficiency” → “Cost Control”**               | **Handled via SCD Type 2**. Old record expires, new record created. Historical reports remain unchanged, new reports reflect updated name. No impact on fact table.                                                                                                                                                             |
+| **5** | **OT Cost Ratio target** changes from `0.12 → 0.10` starting M6              | **Handled via SCD Type 2**. Two valid records in `DIM_KPI`. Fact joins by period, ensuring correct target per month. No need to update historical fact data.                                                                                                                                                                    |
+| **6** | **FOB Revenue now tracked by Department (new grain)**                        | **Breaking change (grain violation)**. Current grain = KPI × Month. New requirement = KPI × Month × Department. Requires schema redesign: add `dept_sk` to fact. Historical data lacks department breakdown → `NULL`. Downstream reports must be updated. Comparability issue must be confirmed with business.                  |
+| **7** | Finance adds **3 new cost categories** in financial file                     | **Handled (schema-on-read)**. `category` stored as raw attribute in fact table (not strict dimension FK). New values flow automatically into Silver/Gold. Only action: validate with business to avoid typo propagation.                                                                                                        |
+| **8** | Two KPIs are **retired (no actuals after M9)**                               | **Partially handled**. No new records appear after M9, historical data preserved. Requires manual update: set `is_active = N` in `DIM_KPI`. Gold excludes inactive KPIs. Late-arriving data should be flagged `is_orphaned = True`.                                                                                            |
+
+
+### Part 7: Data Quality Framework
+#### Task 7A: Required Quaity Checks
+
+| Level | Meaning         | Pipeline Action            |
+| ----- | ----------------| -------------------------- |
+|PASSED | No issues found     |Continue to Gold       |
+|WARNING | Degraded but usable data — needs business review       |Continue to Gold with alert       |
+|FAILED | Data is not trustworthy — pipeline must stop       |Halt — do not build Gold       |
+
+
+
+**Silver Output Not Empty**
+- **Idea**: Row count of Siver table after transformation
+- Logic
+```
+  row_count = df_silver.count()
+  PASSED → row_count > 0
+  FAILED → row_count = 0
+
+```
+<details> 
+<summary>PySpark Script</summary>
+
+```
+# =========================================================
+# CHECK 1 — SILVER NOT EMPTY
+# =========================================================
+def check_not_empty(spark, df: DataFrame, table_name: str) -> DataFrame:
+    """Silver output must have at least 1 row."""
+    row_count = df.count()
+ 
+    if row_count > 0:
+        result = "PASSED"
+        details = f"Row count: {row_count}"
+    else:
+        result = "FAILED"
+        details = "Silver output is empty — pipeline should not proceed to Gold"
+ 
+    print(f"[{result}] {table_name} | not_empty | {details}")
+    return build_log_row(spark, "silver_not_empty", table_name,
+                         result, row_count, details)
+ 
+```
+
+</details>
+
+**Mandatory Columns Present and Not Fully Null**
+- Column exists in schema
+- Column is not 100% null
+- Logic
+```
+  Column missing from schema → FAILED
+  Column exists but fully null → FAILED
+  Column exists and has data  → PASSED
+```
+
+<details> 
+<summary>PySpark Script</summary>
+
+```
+# =========================================================
+# CHECK 2 — MANDATORY COLUMNS PRESENT AND NOT FULLY NULL
+# =========================================================
+def check_mandatory_columns(spark, df: DataFrame, table_name: str,
+                             mandatory_cols: List[str]) -> DataFrame:
+    """
+    FAILED if:
+    - Any mandatory column does not exist in schema
+    - Any mandatory column is fully null (100% null values)
+    """
+    row_count = df.count()
+    issues = []
+ 
+    for col in mandatory_cols:
+        # Check column exists
+        if col not in df.columns:
+            issues.append(f"Column '{col}' missing from schema")
+            continue
+ 
+        # Check column not fully null
+        non_null_count = df.filter(F.col(col).isNotNull()).count()
+        if non_null_count == 0:
+            issues.append(f"Column '{col}' is fully null")
+ 
+    if issues:
+        result = "FAILED"
+        details = " | ".join(issues)
+    else:
+        result = "PASSED"
+        details = f"All mandatory columns present and not fully null: {mandatory_cols}"
+ 
+    print(f"[{result}] {table_name} | mandatory_columns | {details}")
+    return build_log_row(spark, "mandatory_columns", table_name,
+                         result, row_count, details)
+
+```
+</details>
+
+**Orphaned Records Flagged**
+- ``IS_ORPHANED`` column exists in Silver
+- Orphaned records are present and flagged — not silently dropped
+- Logic
+```
+  IS_ORPHANED column missing       → FAILED
+  IS_ORPHANED column exists
+    + orphaned_count > 0           → WARNING (needs business review)
+    + orphaned_count = 0           → PASSED
+```
+
+<details> 
+<summary>PySpark Script</summary>
+  
+```
+# =========================================================
+# CHECK 3 — ORPHANED RECORDS FLAGGED
+# =========================================================
+def check_orphaned_flagged(spark, df: DataFrame, table_name: str) -> DataFrame:
+    """
+    FAILED  — IS_ORPHANED column does not exist
+    WARNING — IS_ORPHANED column exists and has records = True
+    PASSED  — IS_ORPHANED column exists, no orphaned records
+    """
+    row_count = df.count()
+ 
+    if "IS_ORPHANED" not in df.columns:
+        result = "FAILED"
+        details = "IS_ORPHANED column missing — orphaned records not being tracked"
+    else:
+        orphaned_count = df.filter(F.col("IS_ORPHANED") == True).count()
+ 
+        if orphaned_count > 0:
+            result = "WARNING"
+            details = (f"{orphaned_count} orphaned records found. "
+                      "These are flagged and excluded from Gold aggregations. "
+                      "Business review required.")
+        else:
+            result = "PASSED"
+            details = "No orphaned records found"
+ 
+    print(f"[{result}] {table_name} | orphaned_flagged | {details}")
+    return build_log_row(spark, "orphaned_flagged", table_name,
+                         result, row_count, details)
+
+
+```
+</details>
+
+**No Duplicates After Deduplication**
+- Group by composite key — if any group has count > 1, duplicates remain.
+- Logic
+
+```
+duplicate_count = 0  → PASSED
+duplicate_count > 0  → FAILED
+```
+
+<details> 
+<summary>PySpark Script</summary>
+  
+```
+# =========================================================
+# CHECK 4 — NO DUPLICATES AFTER DEDUP
+# =========================================================
+def check_no_duplicates(spark, df: DataFrame, table_name: str,
+                         dedup_key: List[str]) -> DataFrame:
+    """
+    PASSED — no duplicate rows found after deduplication
+    FAILED — duplicate rows still exist
+    """
+    row_count = df.count()
+ 
+    from pyspark.sql import Window
+    window = Window.partitionBy(dedup_key)
+ 
+    duplicate_count = (
+        df.withColumn("_cnt", F.count("*").over(window))
+          .filter(F.col("_cnt") > 1)
+          .count()
+    )
+ 
+    if duplicate_count == 0:
+        result = "PASSED"
+        details = f"No duplicates found on key: {dedup_key}"
+    else:
+        result = "FAILED"
+        details = (f"{duplicate_count} duplicate rows remain on key: {dedup_key}. "
+                  "Deduplication did not complete correctly.")
+ 
+    print(f"[{result}] {table_name} | no_duplicates | {details}")
+    return build_log_row(spark, "no_duplicates", table_name,
+                         result, row_count, details)
+
+```
+</details>
+
+**No OCR Typos in Numeric Columns**
+- Cast numeric columns to DOUBLE. If new nulls appear after cast that
+did not exist before cast, it means some values failed to parse —
+OCR typos likely remain.
+- Logic
+```
+null_before = nulls in column before cast
+null_after  = nulls in column after cast to DOUBLE
+
+new_nulls = null_after - null_before
+
+new_nulls = 0  → PASSED
+new_nulls > 0  → FAILED
+```
+
+<details> 
+<summary>PySpark Script</summary>
+
+```
+# =========================================================
+# CHECK 5 — NO OCR TYPOS IN NUMERIC COLUMNS
+# =========================================================
+def check_no_ocr_typos(spark, df: DataFrame, table_name: str,
+                        numeric_cols: List[str]) -> DataFrame:
+    """
+    PASSED — all numeric columns cast to DOUBLE without producing new nulls
+    FAILED — cast produces new nulls = OCR typos remain
+    """
+    row_count = df.count()
+    issues = []
+ 
+    for col in numeric_cols:
+        if col not in df.columns:
+            continue
+ 
+        # Count nulls before cast
+        null_before = df.filter(F.col(col).isNull()).count()
+ 
+        # Count nulls after cast to double
+        null_after = (
+            df.withColumn("_cast", F.col(col).cast("double"))
+              .filter(F.col("_cast").isNull())
+              .count()
+        )
+ 
+        # New nulls = values that failed to cast = OCR typos remain
+        new_nulls = null_after - null_before
+        if new_nulls > 0:
+            issues.append(
+                f"Column '{col}': {new_nulls} values failed to cast — OCR typos remain"
+            )
+ 
+    if issues:
+        result = "FAILED"
+        details = " | ".join(issues)
+    else:
+        result = "PASSED"
+        details = f"All numeric columns parse correctly: {numeric_cols}"
+ 
+    print(f"[{result}] {table_name} | no_ocr_typos | {details}")
+    return build_log_row(spark, "no_ocr_typos", table_name,
+                         result, row_count, details)
+
+```
+
+</details>
+
+
+**Log All Results**
+
+Every check writes one row to `data_quality_log` with result
+PASSED / WARNING / FAILED.
+
+To view results after pipeline runs:
+```
+dq_log = run_dq_checks(spark, df_kpi_silver, df_financial_silver)
+display(dq_log)
+
+can_proceed = check_dq_gate(dq_log)
+```
+
+
+### TASK 8A- Airflow DAG
+My note on experience
+
+I want to be transparent that I have not used Apache Airflow in production in my previous role.
+
+However, I do have experience with a similar orchestration pattern using Windows Task Scheduler on my laptop/server environment. In that setup, I scheduled my data pipeline to run daily at 13:30, orchestrated multiple scripts in sequence, and wrote logs to monitor whether the pipeline completed successfully or failed at a specific step.
+
+So while Airflow itself is new to me, the underlying concepts are not completely new:
+
+- scheduling jobs on a fixed cadence
+- running tasks in dependency order
+- logging execution status
+- retrying or rerunning failed processes
+- preventing downstream steps from running when upstream data is invalid
+
+For this assessment, I will design the DAG based on my understanding of orchestration concepts and the task dependencies provided in the specification. Where I am not fully certain about Airflow-specific implementation details, I will state my assumptions clearly rather than pretend production experience I do not have.
+
+
+### TASK 9A - Gold Layer Scripts
+
+By the time data reaches the Silver layer, all major transformations have already been completed, including data cleaning, schema standardisation, deduplication, master data matching, and currency normalisation.
+
+Therefore, the focus of the Gold layer is not to fix data, but to build business-ready outputs.
+
+The Gold layer transforms trusted Silver data into curated datasets designed for reporting and analytics, each aligned to a specific business question.
+
+---
+
+**Business Purpose of Gold Outputs**
+
+The following interpretations are based on my understanding of the problem statement and the role of the Gold layer in a typical data warehouse architecture.
+
+I am not making arbitrary assumptions. Instead, I map each required Gold output to the business question it is intended to answer, based on the structure and fields defined in the task.
+
+If there are differences from the actual business intent, they should be clarified with stakeholders. However, the design below reflects my current understanding and reasoning.
+
+---
+
+#### 1. KPI Monthly Achievement Summary
+This table provides a detailed monthly view of KPI performance.
+
+It answers:
+- What is the actual value of each KPI for a given month?
+- What is the target value?
+- How well did the KPI perform relative to target (achievement_pct)?
+- Are there any missing actual values that require attention?
+
+This output is primarily used for KPI monitoring and detailed performance analysis.
+
+---
+
+#### 2. Pillar Monthly Rollup
+This table aggregates KPI performance at the pillar level.
+
+It answers:
+- What is the overall performance of each pillar for a given month?
+- How do multiple KPIs within the same pillar perform collectively?
+
+Only KPIs with valid actual values are included to avoid skewing the average.
+
+This output is used for high-level performance tracking and executive dashboards.
+
+---
+
+#### 3. Order Cost Summary
+This table summarizes operational cost per customer per month in a standard currency (VND).
+
+It answers:
+- How much cost is incurred per customer per month?
+- What is the monthly financial footprint of each customer?
+
+This output supports financial reporting and cost analysis.
+
+---
+
+#### 4. YTD KPI Actuals
+This table provides cumulative KPI performance within a year.
+
+It answers:
+- What is the year-to-date cumulative actual value of each KPI?
+- How is KPI performance progressing over time?
+
+Only months with valid actual values are included to ensure data accuracy.
+
+This output is used for tracking KPI progress against yearly targets.
+
+
+### PART 10:
+#### TASK 10A: Git, CI/CD, and Naming Conventions 
+- The answers below reflect my current knowledge and
+my understand. Where I am not certain, I document what I know,
+what I would do, and what I would learn or confirm with the team.
+I prefer to be transparent about my limits rather than assume
+something I cannot defend.
+
+1. Git Repository Struture
+Based on my experience, I would structure the repository to separate
+concerns clearly — each folder has one responsibility.
+
+```
+  project-root/
+  │
+  ├── dags/                      # Airflow DAGs / orchestration
+  ├── pipelines/                 # Transformation logic per layer
+  │   ├── bronze/
+  │   ├── silver/
+  │   └── gold/
+  ├── ingestion/                 # API and file ingestion scripts
+  ├── common/                    # Shared helpers, utilities, constants
+  ├── tests/                     # Unit tests and integration tests
+  ├── configs/                   # Config files per environment
+  ├── docs/                      # README, design docs, architecture
+  ├── sql/                       # SQL scripts if needed
+  └── requiremen
+```
+2. CI/CD Pipeline on PR to Main
+I do not have experience setting up CI/CD pipelines.
+This is a gap I am aware of and would prioritize learning on the job.
+I am not going to document something I cannot defend in an interview.
+3. Naming onventions
+   - ``snake_case`` for everything — no mixing with camelCase
+   - ``UPPER_SNAKE_CASE`` for metadata/system columns
+   - ``lowercase`` for business columns
+   - Be descriptive but concise — avoid abbreviations that are not obvious
+
+**Tables**
+
+```
+bronze_kpi_actual_raw
+silver_kpi_actual_clean
+gold_kpi_achievement_summary
+
+dim_kpi
+dim_date
+dim_department
+dim_customer
+dim_currency
+
+fact_kpi_actual
+fact_order_cost
+  ```
+
+**Column**
+```
+-- Business columns (lowercase snake_case)
+kpi_id, kpi_name, actual_value, target_value
+order_no, category, period, converted_amount_vnd
+
+-- Metadata columns (UPPER_SNAKE_CASE)
+ROW_HASH, INGESTION_TS, SOURCE_FILE
+IS_DUPLICATE, IS_ORPHANED, IS_CONFLICT
+```
+
+**DAG IDs**
+```
+kpi_monthly_pipeline
+orders_weekly_pipeline
+erp_api_ingestion_daily
+silver_to_gold_kpi_monthly
+```
+
+**Task IDs**
+```
+extract_order_api
+load_bronze_kpi_raw
+transform_silver_orders
+build_gold_kpi_summary
+run_data_quality_checks
+publish_gold_tables
+```
+
+**Pipeline names**
+```
+kpi_reporting_pipeline
+orders_reconciliation_pipeline
+erp_ingestion_pipeline
+monthly_kpi_aggregation_pipeline
+```
+
+**File path in data lake**
+```
+/bronze/kpi/source=excel/year=2026/month=03/file.parquet
+/silver/kpi/year=2026/month=03/data.parquet
+/gold/kpi_monthly_summary/year=2026/month=03/data.parquet
+
+/bronze/orders/source=api/year=2026/month=03/day=15/file.parquet
+/silver/orders/year=2026/month=03/data.parquet
+/gold/orders_monthly_rollup/year=2026/month=03/data.parquet
+```
+
+4. Why Consistent Naming Matters
+Consistent naming helps every team member navigate the codebase,
+understand data structures, and avoid confusion between files,
+scripts, and tables.
