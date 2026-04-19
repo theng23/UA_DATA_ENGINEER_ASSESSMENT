@@ -2134,6 +2134,7 @@ VND rate = 1.0
 Flag failures: IS_FX_CONVERSION_FAILED
 
 12. Metadata columns
+
 | Column                    | Description          |
 | ------------------------- | -------------------- |
 | `INGESTION_TS`            | Processing timestamp |
