@@ -1879,7 +1879,7 @@ Transform and standardize financial data from mixed formats (long + wide) into a
 Processing Steps
 1. Ingestion
 
--Load:
+- Load:
   - financial_long_format.csv
   - financial_wide_format.csv
   - exchange_rates_reference.csv
