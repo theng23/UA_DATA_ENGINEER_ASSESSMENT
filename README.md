@@ -1871,3 +1871,113 @@ df_silver_kpi = df_kpi_with_ua_id.withColumn(
 display(df_silver_kpi)
 ```
 
+#### TASK 5B: Financial File : Bronze to Silver
+
+
+#### TASK 5C: Handle Mixed Units
+
+1. Data Type for `actual_value`
+
+**Decision: `DECIMAL(18,4)`**
+
+| Type            | Problem                                                                 |
+|-----------------|-------------------------------------------------------------------------|
+| **STRING**      | Cannot perform `SUM`, `AVG`, or any calculation. Hides data errors like OCR typos. Not suitable for analytics. |
+| **FLOAT**       | Floating point precision error: `0.1 + 0.2 = 0.30000000004`. Unreliable for financial data. |
+| **DECIMAL(18,4)**| Exact precision, supports calculation, suitable for financial and ratio values. |
+
+###### Conclusion:
+- **`DECIMAL(18,4)`** ensures precision and is fully compatible with BI tools and SQL engines, supporting calculations, aggregations, and handling financial and ratio-based KPIs accurately.
+
+---
+
+2. Preventing Accidental SUM Across Mixed-Unit KPIs
+**Problem**:  
+Power BI defaults to `SUM` on all numeric columns.  
+For example: `SUM(Line Efficiency %) + SUM(FOB Revenue USD)` = meaningless number.
+
+| Solution                                         | Description                                                                                             |
+|--------------------------------------------------|---------------------------------------------------------------------------------------------------------|
+| **Solution 1 — Unit column in fact table**       | Every row in `FACT_KPI_ACTUAL` has a `unit` column (`%`, `NUMBER`, `VND`). BI reports must always filter or group by unit before aggregating. |
+| **Solution 2 — Set "Don't Summarize" in Power BI** | `actual_value` is configured as "Don't Summarize" by default in the Power BI data model. Users must explicitly choose the aggregation method. |
+| **Solution 3 — Gold layer pre-aggregation**      | Gold layer applies the correct `aggregation_method` from `DIM_KPI` (`SUM`, `AVERAGE`, `LAST`) per KPI before serving to BI. BI tool does not need to aggregate raw fact rows — it reads pre-aggregated Gold values. |
+
+###### Conclusion:
+These solutions ensure that KPIs with mixed units (e.g., percentage and numeric values) are properly handled in BI tools, preventing accidental mis-aggregation and ensuring correct results.
+
+---
+
+3. Store % KPIs as 0.85 or 85?
+
+**Decision**: Store as `0.85` (decimal ratio)
+
+| Representation | Risk                                                                                                         |
+|----------------|--------------------------------------------------------------------------------------------------------------|
+| **85**         | User may not know if `85` means `85%` or `85` units. Achievement formula breaks if someone stores `85` instead of `0.85`: `0.85 / 85 = 0.01` — silently wrong. |
+| **0.85**       | Range validation is easy: value must be between 0 and 1. Consistent with most analytics systems. Display layer multiplies by 100 to show `85%`. |
+
+###### Standard:
+- All `%` KPIs are stored as decimal ratios (0–1 range).
+- Display formatting (×100 + `%` symbol) is handled at the BI/Gold layer, not in the fact table.
+
+###### Validation Rule added to DQ framework:
+- If `unit = '%'` and `actual_value > 1` → flag `WARNING`
+  - Likely stored as `85` instead of `0.85`.
+
+---
+
+4. Achievement % Formulas
+The **Direction** for each KPI is stored in the `DIM_KPI.direction` column and read dynamically by the pipeline — meaning no hardcoding per KPI name.
+
+##### **(a) % KPI — Lower is Better**  
+*Example*: OT Cost Ratio, target = `0.12`  
+Formula: `achievement_pct = target / actual`
+
+| Actual Value | Calculation            | Result | Interpretation         |
+|--------------|------------------------|--------|------------------------|
+| `0.09`       | `0.12 / 0.09 = 133.3%`  | ✅     | Above 100% = good      |
+| `0.15`       | `0.12 / 0.15 = 80.0%`   | ❌     | Below 100% = bad      |
+| `0`          | `NULL`                 | -      | Flag in DQ log — divide by zero, needs business review |
+
+##### **(b) % KPI — Higher is Better**  
+*Example*: Line Efficiency, target = `0.85`  
+Formula: `achievement_pct = actual / target`
+
+| Actual Value | Calculation            | Result | Interpretation         |
+|--------------|------------------------|--------|------------------------|
+| `0.90`       | `0.90 / 0.85 = 105.9%`  | ✅     | Above 100% = good      |
+| `0.75`       | `0.75 / 0.85 = 88.2%`   | ❌     | Below 100% = bad      |
+
+##### **(c) Number KPI — SUM Aggregation**  
+*Example*: FOB Revenue, target = `1,200,000`  
+Formula: `achievement_pct = actual / target`
+
+| Actual Value | Calculation              | Result | Interpretation         |
+|--------------|--------------------------|--------|------------------------|
+| `1,500,000`  | `1,500,000 / 1,200,000 = 125.0%` | ✅     | Above target           |
+| `900,000`    | `900,000 / 1,200,000 = 75.0%`   | ❌     | Below target           |
+
+##### **(d) Number KPI — Target is Zero**  
+*Example*: Lost Time Injuries, target = `0`  
+Formula: `achievement_pct = actual / target`  
+→ `actual / 0 = undefined` → cannot calculate.
+
+**Decision**:
+- `achievement_pct = NULL` (not calculable)
+- Flag: `zero_target_kpi = True`
+- Report the `actual_value` directly instead of `achievement_pct`
+- Business interpretation: `0` injuries = perfect, any number of injuries = bad.
+
+**Why not use a workaround like `(1 - actual)`**:
+- This would require hardcoding logic for each KPI, which contradicts the goal of dynamically reading the direction from `DIM_KPI`.
+
+---
+
+##### **Summary Table**
+
+| KPI                     | Direction        | Formula                     | Target = 0   |  
+|-------------------------|------------------|-----------------------------|--------------|
+| **OT Cost Ratio**        | Lower is better  | `target / actual`           | N/A          |
+| **Line Efficiency**      | Higher is better | `actual / target`           | N/A          |
+| **FOB Revenue**          | Higher is better | `actual / target`           | N/A          |
+| **Lost Time Injuries**   | Lower is better  | `target / actual`           | `NULL` — report absolute value |
