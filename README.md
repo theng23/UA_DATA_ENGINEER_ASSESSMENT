@@ -1192,9 +1192,15 @@ display(df_kpi_dim_raw)
 ```
 
 </details>
-- Idea for this step is ingest data Bronze to Silver to transformation
+
+**Idea:** Read both CSV files from Bronze layer into PySpark DataFrames.
+Each file gets a SOURCE_FILE column and a ROW_ID (SHA256 hash of all
+columns) added immediately at ingestion time for traceability.
 
 2. Fix OCR typos
+
+**Idea**: Numeric columns (Target, M1–M12 for long format; Target, Jan-24–Dec-24
+for wide format) may contain letter O instead of digit 0 due to OCR errors.
 
 <details> 
 <summary>PySpark Script</summary>
@@ -1324,6 +1330,9 @@ display(df_kpi_wide_ocr_fixed)
   - wide: Jan-24..Dec-24 + Target
   
 3. Normalise whitespace and casing
+
+**Idea:** Standardize all categorical columns to UPPER case with trimmed
+whitespace to ensure consistent joining and grouping downstream.
 
 <details> 
 <summary>PySpark Script</summary>
@@ -1470,14 +1479,18 @@ display(df_kpi_wide_cleaned)
 ```
 </details>
 
-Idea là chuẩn hóa lại tên cũng như là lưu lại log với những cái thay đổi
-  1. Lưu giá trị cũ
-  2. Apply TRIM + UPPER
-  3. So sánh cũ vs mới
-  4. Nếu khác → log
-  5. Update column
+
     
-4. 3
+4. Detect and remove duplicate rows
+
+**Idea:** Detect exact duplicate rows before unpivoting. Two passes of
+deduplication are applied:
+
+**Before unpivot** (exact row duplicates):
+Hash all columns — if two rows are identical in every column, keep 1,
+flag the rest as IS_DUPLICATE = True.
+**After unpivot** (business key duplicates):
+Deduplicate on composite key: ``Pillar`` + ``Sub_Pillar`` + ``Department`` + ``KPI_Name`` + ``Sub_KPI_Type`` + PERIOD
 
 <details> 
 <summary>PySpark Script</summary>
@@ -1639,23 +1652,222 @@ display(df_kpi_wide_deduped)
 ```
 </details>
 
-Idea detect và remove duplicate row -> count được 3 trường hợp log phát hiện lỗi và dropped vì bị duplicate row với nhau
--> sau khi dedup thì kpi_actual_long.csv bị dedup với các cột sau
+-> Duplicates found in kpi_actual_long.csv:
   - FS || Revenue || Commercial || FOB Revenue || Export || NUMBER ||
   - OF || Productivity || Production || Line Efficiency || Line A || % ||
   - OF || Training || HR || Training Completion || Internal || %
-5. Idea sẽ là unpivot wide format (jan-24...dec-24) into period với format là YYYY-MM
-6. Idea sẽ là unpivot long format M1-M12 into period với format là YYYY-MM
-7. Reconcile both formats into a single unified schema :document how you handle discrepancies
-between them. được hiểu là 
-Case 1 → dedup, giữ 1 row, flag IS_DUPLICATE = True
-Case 2 → giữ cả 2, flag conflict, để business quyết định
-Case 3 → giữ nguyên, không drop
-Case 4 → rename về schema chuẩn trước khi union
 
-Tóm tắt cách xử lý discrepancies
-CaseXử lýCùng KPI + PERIOD + valueDedup, giữ 1, flag IS_DUPLICATE=TrueCùng KPI + PERIOD, khác valueGiữ cả 2, flag IS_CONFLICT=TrueKPI có trong long không có trong wideGiữ nguyên, không dropColumn tên khác nhauRename về schema chuẩn trước khi union
+5. Unpivot Wide Format (jan-24...dec-24) into period with format là YYYY-MM
 
-8. Join với bảng dim thông qua Pillar + Sub_Pillar + Department + KPI_Name + Sub_KPI_Type để lấy UA_ID
-9. Ráng cờ cho những record null cụ thể là sẽ dùng IS_ORPHANED và không drop nó
-10. add thêm ROW_HASH (SHA256), INGESTION_TS, SOURCES_FILE, IS_DUPLICATE, IS_ORPHANED
+<details> 
+<summary>PySpark Script</summary>
+  
+```
+from pyspark.sql import functions as F
+import re
+
+# =========================================================
+# UNPIVOT WIDE FILE (Jan-24...Dec-24) INTO PERIOD (YYYY-MM)
+# =========================================================
+def unpivot_wide(df):
+    # Get all month columns (e.g., Jan-24, Feb-24, ..., Dec-24)
+    month_cols = [col for col in df.columns if re.fullmatch(r"[A-Za-z]{3}-\d{2}", col)]
+    
+    # Apply the unpivot operation using a correctly formatted string for stack
+    stack_expr = ", ".join([f"'{col}', `{col}`" for col in month_cols])
+    unpivoted_df = (
+        df.select(
+            "*",  # Keep all existing columns
+            F.expr(f"stack({len(month_cols)}, {stack_expr}) as (month_token, actual_value)")
+        )
+        .withColumn("PERIOD", F.concat(F.lit("20"), F.regexp_extract(F.col("month_token"), r"([A-Za-z]{3})-(\d{2})", 2), F.lit("-"), F.lit("01")))
+        .drop("month_token")  # Drop the temporary 'month_token' column
+    )
+
+    return unpivoted_df
+
+# =========================================================
+# APPLY UNPIVOT TO WIDE DATA
+# =========================================================
+df_kpi_wide_unpivoted = unpivot_wide(df_kpi_wide_ocr_fixed)
+
+# Preview the unpivoted dataframe
+print("=== WIDE AFTER UNPIVOT ===")
+display(df_kpi_wide_unpivoted) 
+```
+
+</details>
+
+
+
+6. Unpivot Long Format (M1–M12 → PERIOD)
+
+
+<details> 
+<summary>PySpark Script</summary>
+  
+```
+# =========================================================
+# UNPIVOT LONG FORMAT M1 - M12 INTO PERIOD (YYYY-MM)
+# =========================================================
+def unpivot_long(df):
+    # Get all month columns (e.g., M1, M2, ..., M12)
+    month_cols = [col for col in df.columns if re.fullmatch(r"M([1-9]|1[0-2])", col)]
+    
+    # Apply unpivot operation using stack to convert columns to rows
+    stack_expr = ", ".join([f"'{col}', `{col}`" for col in month_cols])
+    unpivoted_df = (
+        df.select(
+            "*",  # Keep all existing columns
+            F.expr(f"stack({len(month_cols)}, {stack_expr}) as (month_token, actual_value)")  # unpivot months
+        )
+        .withColumn("PERIOD", F.concat(F.lit("2024-"), F.regexp_extract(F.col("month_token"), r"^M(\d{1,2})$", 1)))
+        .drop("month_token")  # Drop the temporary 'month_token' column
+    )
+
+    return unpivoted_df
+
+# =========================================================
+# APPLY UNPIVOT TO LONG DATA
+# =========================================================
+df_kpi_long_unpivoted = unpivot_long(df_kpi_long_ocr_fixed)
+
+# Preview the unpivoted dataframe
+print("=== LONG AFTER UNPIVOT ===")
+display(df_kpi_long_unpivoted)
+```
+
+</details>
+
+7. Reconcile both formats into a single unified schema
+
+**Idea:** Union both unpivoted DataFrames into a single unified schema
+and handle discrepancies explicitly.
+
+<details> 
+<summary>PySpark Script</summary>
+  
+```
+from pyspark.sql import functions as F
+
+# =========================================================
+# RECONCILE BOTH SOURCES INTO A SINGLE UNIFIED SCHEMA
+# =========================================================
+def reconcile_sources(df_long, df_wide):
+    # Normalize missing Sub_Pillar
+    df_long = df_long.withColumn("Sub_Pillar", F.coalesce(F.col("Sub_Pillar"), F.lit("UNKNOWN")))
+    df_wide = df_wide.withColumn("Sub_Pillar", F.coalesce(F.col("Sub_Pillar"), F.lit("UNKNOWN")))
+
+    # Handle missing Sub_KPI_Type by replacing NULL or empty with 'N/A'
+    df_long = df_long.withColumn("Sub_KPI_Type", F.coalesce(F.col("Sub_KPI_Type"), F.lit("N/A")))
+    df_wide = df_wide.withColumn("Sub_KPI_Type", F.coalesce(F.col("Sub_KPI_Type"), F.lit("N/A")))
+
+    # Ensure the columns match before union
+    unified_df = df_long.unionByName(df_wide, allowMissingColumns=True)
+
+    # Clean up discrepancies in Sub_Pillar
+    unified_df = unified_df.withColumn("Sub_Pillar", F.trim(F.regexp_replace(F.col("Sub_Pillar"), r"\s+", " ")))
+
+    # Optionally: Deduplicate based on key columns
+    unified_df = unified_df.dropDuplicates(
+        ["Pillar", "Sub_Pillar", "Department", "KPI_Name", "Sub_KPI_Type", "Unit", "PERIOD"]
+    )
+
+    return unified_df
+
+
+# =========================================================
+# APPLY RECONCILE TO LONG AND WIDE UNPIVOTED DATA
+# =========================================================
+df_kpi_unified = reconcile_sources(df_kpi_long_unpivoted, df_kpi_wide_unpivoted)
+
+# Preview the unified dataframe
+print("=== UNIFIED DATA AFTER RECONCILE ===")
+display(df_kpi_unified)
+
+```
+
+</details>
+
+**Discrepancy Handling**
+
+| Case | Situation | How I Handle It |
+|------|-----------|-----------------|
+| **Case 1** | Same KPI + PERIOD + same value (exact duplicate) | Deduplicate — keep 1 row, flag `IS_DUPLICATE = True` on dropped rows |
+| **Case 2** | Same KPI + PERIOD + different value (conflict) | Keep **both** rows, flag `IS_CONFLICT = True` on both |
+| **Case 3** | KPI exists in long format but not in wide (or vice versa) | Keep as-is, do not drop |
+| **Case 4** | Column names differ between formats | Rename to unified schema before union |
+
+
+
+8. Match to UA_ID via Composite Natural Key
+
+**Idea:** Join unified dataset with kpi_master_dim.csv using a composite
+natural key to retrieve UA_ID for each record.
+
+``Pillar + Sub_Pillar + Department + KPI_Name + Sub_KPI_Type``
+
+<details> 
+<summary>PySpark Script</summary>
+  
+```
+from pyspark.sql import functions as F
+
+# Perform the join with aliases for the columns to avoid ambiguity
+df_kpi_with_ua_id = df_kpi_dim_raw.alias("df_raw").join(
+    df_kpi_unified.alias("df_unified"),
+    (F.col("df_raw.Pillar") == F.col("df_unified.Pillar")) &
+    (F.col("df_raw.Sub_Pillar") == F.col("df_unified.Sub_Pillar")) &
+    (F.col("df_raw.Department") == F.col("df_unified.Department")) &
+    (F.col("df_raw.KPI_Name") == F.col("df_unified.KPI_Name")) &
+    (F.col("df_raw.Sub_KPI_Type") == F.col("df_unified.Sub_KPI_Type")),
+    how="left"  # Left join to ensure no data loss from df_kpi
+)
+
+# Debugging: Print schema to ensure the Target column is present
+df_kpi_with_ua_id.printSchema()
+
+# Display the result
+print("=== Result after join with UA_ID ===")
+display(df_kpi_with_ua_id)
+```
+
+</details>
+
+9. Flag Orphaned Records
+
+**Idea:** Records that do not match any active master record are flagged
+as orphaned — they are NOT dropped.
+
+```
+df_kpi_with_ua_id = df_kpi_with_ua_id.withColumn(
+    "IS_ORPHANED",
+    F.when(F.col("UA_ID").isNull(), True).otherwise(False)
+)
+```
+
+10. Add Metadata Columns
+
+**Idea:** Add standard metadata columns to every Silver record.
+
+```
+hash_cols = [
+    "PILLAR_ID", "SP_ID", "UA_ID",
+    "Pillar", "Sub_Pillar", "Department",
+    "KPI_Name", "Sub_KPI_Type", "Unit",
+    "PERIOD", "actual_value"
+]
+
+df_silver_kpi = df_kpi_with_ua_id.withColumn(
+    "ROW_HASH",
+    F.sha2(
+        F.concat_ws("||", *[
+            F.coalesce(F.col(c).cast("string"), F.lit(""))
+            for c in hash_cols
+        ]),
+        256
+    )
+)
+display(df_silver_kpi)
+```
+
